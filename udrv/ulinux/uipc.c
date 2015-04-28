@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -730,12 +731,15 @@ UDRV_API BOOLEAN UIPC_Send(tUIPC_CH_ID ch_id, UINT16 msg_evt, UINT8 *p_buf,
 
     if (write(uipc_main.ch[ch_id].fd, p_buf, msglen) < 0)
     {
+        BTIF_TRACE_DEBUG1("fd=%d", uipc_main.ch[ch_id].fd);
         BTIF_TRACE_ERROR1("failed to write (%s)", strerror(errno));
+        UIPC_UNLOCK()
+        return FALSE;
     }
 
     UIPC_UNLOCK();
 
-    return FALSE;
+    return TRUE;
 }
 
 /*******************************************************************************

@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -81,6 +82,9 @@ const tBTA_AV_CO_FUNCTS bta_av_a2d_cos =
     bta_av_co_audio_start,
     bta_av_co_audio_stop,
     bta_av_co_audio_src_data_path,
+#ifdef A2DP_SINK
+    bta_av_co_audio_snk_data_path,
+#endif
     bta_av_co_audio_delay
 };
 
@@ -113,6 +117,9 @@ const tBTA_AV_SACT bta_av_a2d_action[] =
     bta_av_str_stopped,     /* BTA_AV_STR_STOPPED */
     bta_av_reconfig,        /* BTA_AV_RECONFIG */
     bta_av_data_path,       /* BTA_AV_DATA_PATH */
+#ifdef A2DP_SINK
+    bta_av_snk_data_path,   /* BTA_AV_SNK_DATA_PATH */
+#endif
     bta_av_start_ok,        /* BTA_AV_START_OK */
     bta_av_start_failed,    /* BTA_AV_START_FAILED */
     bta_av_str_closed,      /* BTA_AV_STR_CLOSED */
@@ -899,11 +906,19 @@ void bta_av_do_disc_a2d (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
         db_params.p_db = p_scb->p_disc_db;
         db_params.p_attrs = attr_list;
 
+#ifdef A2DP_SINK
+        if(A2D_FindService(UUID_SERVCLASS_AUDIO_SOURCE, p_scb->peer_addr, &db_params,
+                        bta_av_a2d_sdp_cback) == A2D_SUCCESS)
+        {
+            return;
+        }
+#else
         if(A2D_FindService(UUID_SERVCLASS_AUDIO_SINK, p_scb->peer_addr, &db_params,
                         bta_av_a2d_sdp_cback) == A2D_SUCCESS)
         {
             return;
         }
+#endif
     }
 
     /* when the code reaches here, either the DB is NULL
@@ -2051,6 +2066,62 @@ void bta_av_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
         }
     }
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+**
+** Function         bta_av_snk_data_path
+**
+** Description      Handle stream sink data path.
+**
+** Returns          void
+**
+*******************************************************************************/
+void bta_av_snk_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
+{
+    BT_HDR *p_buf;
+
+    /* get a buffer from a2d queue to transport */
+    p_buf = (BT_HDR *)GKI_dequeue(&p_scb->q_info.a2d);
+    if (p_buf)
+    {
+        APPL_TRACE_DEBUG0("get a buffer from a2d queue");
+        if (p_scb->p_cos->snk_data(p_scb->codec_type, p_buf))
+        {
+            APPL_TRACE_DEBUG0("successful to transport, put new data into a2d queue");
+            /* successful to transport, put new data into a2d queue */
+            GKI_enqueue(&p_scb->q_info.a2d, p_data);
+        }
+        else
+        {
+            APPL_TRACE_DEBUG0("failed to transport, put the buffer back to a2d queue");
+            /* failed to transport, put the buffer back to a2d queue */
+            GKI_enqueue_head(&p_scb->q_info.a2d, p_buf);
+            if (p_scb->q_info.a2d.count < 3)
+            {
+                /* a2d queue is not full, put new data into a2d queue */
+                GKI_enqueue(&p_scb->q_info.a2d, p_data);
+            }
+            else
+            {
+                APPL_TRACE_DEBUG0("too many buffers in a2d queue, drop new data");
+                GKI_freebuf(p_data);
+            }
+        }
+    }
+    else
+    {
+        APPL_TRACE_DEBUG0("no buffer in a2d queue, transport new data directly");
+        /* no buffer in a2d queue, transport new data directly */
+        if (!p_scb->p_cos->snk_data(p_scb->codec_type, (BT_HDR *)p_data))
+        {
+            APPL_TRACE_DEBUG0("failed to transport data, put data into a2d queue");
+            /* failed to transport buffer, put buffer into a2d queue*/
+            GKI_enqueue(&p_scb->q_info.a2d, p_data);
+        }
+    }
+}
+#endif
 
 /*******************************************************************************
 **

@@ -9,6 +9,10 @@ else
   bdroid_CFLAGS := -DHAS_NO_BDROID_BUILDCFG
 endif
 
+ifeq ($(BLUETOOTH_A2DP_SINK),true)
+  bdroid_CFLAGS += -DA2DP_SINK
+endif
+
 include $(call all-subdir-makefiles)
 
 # Cleanup our locals

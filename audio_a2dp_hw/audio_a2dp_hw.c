@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -78,10 +79,16 @@ typedef enum {
 } a2dp_state_t;
 
 struct a2dp_stream_out;
+#ifdef A2DP_SINK
+struct a2dp_stream_in;
+#endif
 
 struct a2dp_audio_device {
     struct audio_hw_device device;
     struct a2dp_stream_out *output;
+#ifdef A2DP_SINK
+    struct a2dp_stream_in  *input;
+#endif
 };
 
 struct a2dp_config {
@@ -104,6 +111,14 @@ struct a2dp_stream_out {
 
 struct a2dp_stream_in {
     struct audio_stream_in stream;
+#ifdef A2DP_SINK
+    pthread_mutex_t        lock;
+    int                    ctrl_fd;
+    int                    audio_fd;
+    size_t                 buffer_sz;
+    a2dp_state_t           state;
+    struct a2dp_config     cfg;
+#endif
 };
 
 /*****************************************************************************
@@ -245,6 +260,39 @@ static int skt_connect(struct a2dp_stream_out *out, char *path)
     return skt_fd;
 }
 
+#ifdef A2DP_SINK
+static int skt_connect_in(struct a2dp_stream_in *in, char *path)
+{
+    int ret;
+    int skt_fd;
+    struct sockaddr_un remote;
+    int len;
+
+    INFO("connect to %s (sz %d)", path, in->buffer_sz);
+
+    skt_fd = socket(AF_LOCAL, SOCK_STREAM, 0);
+
+    if(socket_local_client_connect(skt_fd, path,
+            ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_STREAM) < 0)
+    {
+        ERROR("failed to connect (%s)", strerror(errno));
+        close(skt_fd);
+        return -1;
+    }
+
+    len = in->buffer_sz;
+    ret = setsockopt(skt_fd, SOL_SOCKET, SO_SNDBUF, (char*)&len, (int)sizeof(len));
+
+    /* only issue warning if failed */
+    if (ret < 0)
+        ERROR("setsockopt failed (%s)", strerror(errno));
+
+    INFO("connected to stack fd = %d", skt_fd);
+
+    return skt_fd;
+}
+#endif
+
 static int skt_write(int fd, const void *p, size_t len)
 {
     int sent;
@@ -271,6 +319,34 @@ static int skt_write(int fd, const void *p, size_t len)
 
     return sent;
 }
+
+#ifdef A2DP_SINK
+static int skt_read(int fd, void *p, size_t len)
+{
+    int recved;
+    struct pollfd pfd;
+
+    FNLOG();
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+
+    /* poll for 500 ms */
+    /* recv time out */
+    if (poll(&pfd, 1, 500) == 0)
+        return 0;
+
+    ts_log("skt_read", len, NULL);
+
+    if ((recved = recv(fd, p, len, MSG_NOSIGNAL)) == -1)
+    {
+        ERROR("read failed with errno=%d\n", errno);
+        return -1;
+    }
+
+    return recved;
+}
+#endif
 
 static int skt_disconnect(int fd)
 {
@@ -328,6 +404,40 @@ static int a2dp_command(struct a2dp_stream_out *out, char cmd)
     return 0;
 }
 
+#ifdef A2DP_SINK
+static int a2dp_command_in(struct a2dp_stream_in *in, char cmd)
+{
+    char ack;
+
+    DEBUG("A2DP COMMAND %s", dump_a2dp_ctrl_event(cmd));
+
+    /* send command */
+    if (send(in->ctrl_fd, &cmd, 1, MSG_NOSIGNAL) == -1)
+    {
+        ERROR("cmd failed (%s)", strerror(errno));
+        skt_disconnect(in->ctrl_fd);
+        in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
+        return -1;
+    }
+
+    /* wait for ack byte */
+    if (recv(in->ctrl_fd, &ack, 1, MSG_NOSIGNAL) < 0)
+    {
+        ERROR("ack failed (%s)", strerror(errno));
+        skt_disconnect(in->ctrl_fd);
+        in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
+        return -1;
+    }
+
+    DEBUG("A2DP COMMAND %s DONE STATUS %d", dump_a2dp_ctrl_event(cmd), ack);
+
+    if (ack != A2DP_CTRL_ACK_SUCCESS)
+        return -1;
+
+    return 0;
+}
+#endif
+
 /*****************************************************************************
 **
 ** AUDIO DATA PATH
@@ -355,6 +465,30 @@ static void a2dp_stream_out_init(struct a2dp_stream_out *out)
     /* manages max capacity of socket pipe */
     out->buffer_sz = AUDIO_STREAM_OUTPUT_BUFFER_SZ;
 }
+
+#ifdef A2DP_SINK
+static void a2dp_stream_in_init(struct a2dp_stream_in *in)
+{
+    pthread_mutexattr_t lock_attr;
+
+    FNLOG();
+
+    pthread_mutexattr_init(&lock_attr);
+    pthread_mutexattr_settype(&lock_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&in->lock, &lock_attr);
+
+    in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
+    in->audio_fd = AUDIO_SKT_DISCONNECTED;
+    in->state = AUDIO_A2DP_STATE_STOPPED;
+
+    in->cfg.channel_flags = AUDIO_STREAM_DEFAULT_INPUT_CHANNEL_FLAG;
+    in->cfg.format = AUDIO_STREAM_DEFAULT_FORMAT;
+    in->cfg.rate = AUDIO_STREAM_DEFAULT_RATE;
+
+    /* manages max capacity of socket pipe */
+    in->buffer_sz = AUDIO_STREAM_INPUT_BUFFER_SZ;
+}
+#endif
 
 static int start_audio_datapath(struct a2dp_stream_out *out)
 {
@@ -402,6 +536,43 @@ static int start_audio_datapath(struct a2dp_stream_out *out)
     return 0;
 }
 
+#ifdef A2DP_SINK
+static int start_audio_in_datapath(struct a2dp_stream_in *in)
+{
+    int oldstate = in->state;
+
+    INFO("state %d", in->state);
+
+    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
+        return -1;
+
+    in->state = AUDIO_A2DP_STATE_STARTING;
+
+    if (a2dp_command_in(in, A2DP_CTRL_CMD_START) < 0)
+    {
+        ERROR("audio-in-path start failed");
+
+        in->state = oldstate;
+        return -1;
+    }
+
+    /* connect socket if not yet connected */
+    if (in->audio_fd == AUDIO_SKT_DISCONNECTED)
+    {
+        in->audio_fd = skt_connect_in(in, A2DP_DATA_PATH);
+
+        if (in->audio_fd < 0)
+        {
+            in->state = oldstate;
+            return -1;
+        }
+
+        in->state = AUDIO_A2DP_STATE_STARTED;
+    }
+
+    return 0;
+}
+#endif
 
 static int stop_audio_datapath(struct a2dp_stream_out *out)
 {
@@ -468,6 +639,34 @@ static int suspend_audio_datapath(struct a2dp_stream_out *out, bool standby)
     return 0;
 }
 
+#ifdef A2DP_SINK
+static int suspend_audio_in_datapath(struct a2dp_stream_in *in, bool standby)
+{
+    INFO("state %d", in->state);
+
+    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
+         return -1;
+
+    if (in->state == AUDIO_A2DP_STATE_STOPPING)
+        return -1;
+
+    if (a2dp_command_in(in, A2DP_CTRL_CMD_SUSPEND) < 0)
+        return -1;
+
+    if (standby)
+        in->state = AUDIO_A2DP_STATE_STANDBY;
+    else
+        in->state = AUDIO_A2DP_STATE_SUSPENDED;
+
+    /* disconnect audio path */
+    skt_disconnect(in->audio_fd);
+
+    in->audio_fd = AUDIO_SKT_DISCONNECTED;
+
+    return 0;
+}
+#endif
+
 static int check_a2dp_ready(struct a2dp_stream_out *out)
 {
     INFO("state %d", out->state);
@@ -493,6 +692,19 @@ static int check_a2dp_stream_started(struct a2dp_stream_out *out)
    return 0;
 }
 
+#ifdef A2DP_SINK
+static int check_a2dp_ready_in(struct a2dp_stream_in *in)
+{
+    INFO("state %d", in->state);
+
+    if (a2dp_command_in(in, A2DP_CTRL_CMD_CHECK_READY) < 0)
+    {
+        ERROR("check a2dp ready failed");
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 /*****************************************************************************
 **
@@ -770,44 +982,115 @@ static int out_remove_audio_effect(const struct audio_stream *stream, effect_han
 
 static uint32_t in_get_sample_rate(const struct audio_stream *stream)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+
+    DEBUG("rate %d", in->cfg.rate);
+
+    return in->cfg.rate;
+#else
     FNLOG();
     return 8000;
+#endif
 }
 
 static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+
+    DEBUG("in_set_sample_rate : %d", rate);
+
+    if (rate != AUDIO_STREAM_DEFAULT_RATE)
+    {
+        ERROR("only rate %d supported", AUDIO_STREAM_DEFAULT_RATE);
+        return -1;
+    }
+
+    in->cfg.rate = rate;
+
+    return 0;
+#else
     FNLOG();
     return 0;
+#endif
 }
 
 static size_t in_get_buffer_size(const struct audio_stream *stream)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+
+    DEBUG("buffer_size : %d", in->buffer_sz);
+
+    return in->buffer_sz;
+#else
     FNLOG();
     return 320;
+#endif
 }
 
 static uint32_t in_get_channels(const struct audio_stream *stream)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+
+    DEBUG("channels 0x%x", in->cfg.channel_flags);
+
+    return in->cfg.channel_flags;
+#else
     FNLOG();
     return AUDIO_CHANNEL_IN_MONO;
+#endif
 }
 
 static audio_format_t in_get_format(const struct audio_stream *stream)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+
+    DEBUG("format 0x%x", in->cfg.format);
+
+    return in->cfg.format;
+#else
     FNLOG();
     return AUDIO_FORMAT_PCM_16_BIT;
+#endif
 }
 
 static int in_set_format(struct audio_stream *stream, audio_format_t format)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+    DEBUG("setting format not yet supported (0x%x)", format);
+    return -ENOSYS;
+#else
     FNLOG();
     return 0;
+#endif
 }
 
 static int in_standby(struct audio_stream *stream)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+    int retVal = 0;
+
+    FNLOG();
+
+    pthread_mutex_lock(&in->lock);
+
+    if (in->state == AUDIO_A2DP_STATE_STARTED)
+        retVal =  suspend_audio_in_datapath(in, true);
+    else
+        retVal = 0;
+    pthread_mutex_unlock (&in->lock);
+
+    return retVal;
+#else
     FNLOG();
     return 0;
+#endif
 }
 
 static int in_dump(const struct audio_stream *stream, int fd)
@@ -838,8 +1121,61 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
 static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
                        size_t bytes)
 {
+#ifdef A2DP_SINK
+    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
+    int recved;
+
+    DEBUG("read %d bytes (fd %d)", bytes, in->audio_fd);
+
+    if (in->state == AUDIO_A2DP_STATE_SUSPENDED)
+    {
+        DEBUG("stream suspended");
+        return -1;
+    }
+
+    /* only allow autostarting if we are in stopped or standby */
+    if ((in->state == AUDIO_A2DP_STATE_STOPPED) ||
+        (in->state == AUDIO_A2DP_STATE_STANDBY))
+    {
+        pthread_mutex_lock(&in->lock);
+
+        if (start_audio_in_datapath(in) < 0)
+        {
+            /* emulate time this read represents to avoid very fast read
+               failures during transition periods or remote suspend */
+
+            int us_delay = calc_audiotime(in->cfg, bytes);
+
+            DEBUG("emulate a2dp read delay (%d us)", us_delay);
+
+            usleep(us_delay);
+            pthread_mutex_unlock(&in->lock);
+            return -1;
+        }
+
+        pthread_mutex_unlock(&in->lock);
+    }
+    else if (in->state != AUDIO_A2DP_STATE_STARTED)
+    {
+        ERROR("stream not in stopped or standby");
+        return -1;
+    }
+
+    recved = skt_read(in->audio_fd, buffer, bytes);
+
+    if (recved == -1)
+    {
+        skt_disconnect(in->audio_fd);
+        in->audio_fd = AUDIO_SKT_DISCONNECTED;
+        in->state = AUDIO_A2DP_STATE_STOPPED;
+    }
+
+    DEBUG("read %d bytes out of %d bytes", recved, bytes);
+    return recved;
+#else
     FNLOG();
     return bytes;
+#endif
 }
 
 static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
@@ -1058,6 +1394,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     struct a2dp_audio_device *ladev = (struct a2dp_audio_device *)dev;
     struct a2dp_stream_in *in;
     int ret;
+    int i;
 
     FNLOG();
 
@@ -1082,12 +1419,55 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
 
+#ifdef A2DP_SINK
+    /* initialize a2dp specifics */
+    a2dp_stream_in_init(in);
+
+   /* set input config values */
+   if (config)
+   {
+      config->format = in_get_format((const struct audio_stream *)&in->stream);
+      config->sample_rate = in_get_sample_rate((const struct audio_stream *)&in->stream);
+      config->channel_mask = in_get_channels((const struct audio_stream *)&in->stream);
+   }
+#endif
     *stream_in = &in->stream;
+
+#ifdef A2DP_SINK
+    /* retry logic to catch any timing variations on control channel */
+    for (i = 0; i < CTRL_CHAN_RETRY_COUNT; i++)
+    {
+        /* connect control channel if not already connected */
+        if ((in->ctrl_fd = skt_connect_in(in, A2DP_CTRL_PATH)) > 0)
+        {
+            /* success, now check if stack is ready */
+            if (check_a2dp_ready_in(in) == 0)
+                break;
+
+            ERROR("error : a2dp not ready, wait 250 ms and retry");
+            usleep(250000);
+            skt_disconnect(in->ctrl_fd);
+        }
+
+        /* ctrl channel not ready, wait a bit */
+        usleep(250000);
+    }
+
+    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
+    {
+        ERROR("ctrl socket failed to connect (%s)", strerror(errno));
+        ret = -1;
+        goto err_open;
+    }
+#endif
+
+    DEBUG("success");
     return 0;
 
 err_open:
     free(in);
     *stream_in = NULL;
+    ERROR("failed");
     return ret;
 }
 

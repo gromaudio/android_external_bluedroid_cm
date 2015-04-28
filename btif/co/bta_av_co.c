@@ -2,6 +2,7 @@
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -800,6 +801,70 @@ BTA_API void * bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type, UINT32 *p
     return p_buf;
 }
 
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         bta_av_co_audio_snk_data_path
+ **
+ ** Description      This function is called to manage data transfer from
+ **                  the AVDTP to audio codec.
+ **
+ ** Returns          TRUE-successful, FALSE-failed
+ **
+ *******************************************************************************/
+BTA_API BOOLEAN bta_av_co_audio_snk_data_path(tBTA_AV_CODEC codec_type,
+                                           BT_HDR *p_buf)
+{
+    UINT32 timestamp;
+    UINT16 seq_num;
+
+    FUNC_TRACE();
+
+    if (p_buf == NULL) {
+        APPL_TRACE_ERROR0("pointer to audio data is NULL");
+        return FALSE;
+    }
+
+#if defined(BTA_AV_CO_CP_SCMS_T) && (BTA_AV_CO_CP_SCMS_T == TRUE)
+    {
+        UINT8 *p;
+        if (bta_av_co_cp_is_active())
+        {
+            p = (UINT8 *)(p_buf + 1) + p_buf->offset;
+            bta_av_co_cp_set_flag(*p);
+            p_buf->len--;
+            p_buf->offset++;
+        }
+    }
+#endif
+
+    switch (codec_type)
+    {
+    case BTA_AV_CODEC_SBC:
+        /* In media packet SBC, the following information is available:
+         * p_buf->layer_specific : number of SBC frames in the packet
+         * p_buf->word[0] : timestamp
+         * p_buf->word[1] : seq_num
+         */
+         timestamp = *(UINT32 *)(p_buf + 1);
+         seq_num = *((UINT16 *)(p_buf + 1) + 2);
+
+        /* Parse packet header */
+        bta_av_sbc_prs_hdr(p_buf, &p_buf->layer_specific);
+        break;
+
+    default:
+        APPL_TRACE_ERROR1("bta_av_co_audio_snk_data_path Unsupported codec type (%d)", codec_type);
+        return FALSE;
+    }
+
+    btif_media_aa_writebuf(p_buf, timestamp, seq_num);
+    btif_media_aa_snk_data_ready();
+
+    return TRUE;
+}
+#endif
+
 /*******************************************************************************
  **
  ** Function         bta_av_co_audio_drop
@@ -1263,6 +1328,9 @@ BOOLEAN bta_av_co_audio_set_codec(const tBTIF_AV_MEDIA_FEEDINGS *p_feeding, tBTI
     switch (p_feeding->format)
     {
     case BTIF_AV_CODEC_PCM:
+#ifdef A2DP_SINK
+    case BTIF_AV_CODEC_SBC:
+#endif
         new_cfg.id = BTIF_AV_CODEC_SBC;
 
         sbc_config = btif_av_sbc_default_config;

@@ -76,6 +76,10 @@ LOCAL_SRC_FILES+= \
 	../embdrv/sbc/encoder/srce/sbc_encoder.c \
 	../embdrv/sbc/encoder/srce/sbc_packing.c \
 
+# sbc decoder
+LOCAL_SRC_FILES+= \
+	../embdrv/sbc/decoder/srce/sbc_decoder.c \
+
 LOCAL_SRC_FILES+= \
 	../udrv/ulinux/uipc.c
 
@@ -101,6 +105,7 @@ LOCAL_C_INCLUDES+= . \
 	$(LOCAL_PATH)/../hci/include\
 	$(LOCAL_PATH)/../brcm/include \
 	$(LOCAL_PATH)/../embdrv/sbc/encoder/include \
+	$(LOCAL_PATH)/../embdrv/sbc/decoder/include \
 	$(LOCAL_PATH)/../audio_a2dp_hw \
 	$(LOCAL_PATH)/../utils/include \
 	$(bdroid_C_INCLUDES) \

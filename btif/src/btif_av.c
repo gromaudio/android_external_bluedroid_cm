@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -766,8 +767,11 @@ bt_status_t btif_av_init(void)
     {
         if (btif_a2dp_start_media_task() != GKI_SUCCESS)
             return BT_STATUS_FAIL;
-
+#ifdef A2DP_SINK
+        btif_enable_service(BTA_A2DP_SOURCE_SERVICE_ID);
+#else
         btif_enable_service(BTA_A2DP_SERVICE_ID);
+#endif
 
         /* Also initialize the AV state machine */
         btif_av_cb.sm_handle = btif_sm_init((const btif_sm_handler_t*)btif_av_state_handlers, BTIF_AV_STATE_IDLE);
@@ -828,10 +832,14 @@ static bt_status_t connect_int(bt_bdaddr_t *bd_addr)
 static bt_status_t connect(bt_bdaddr_t *bd_addr)
 {
     CHECK_BTAV_INIT();
+#ifdef A2DP_SINK
+    return btif_queue_connect(UUID_SERVCLASS_AUDIO_SINK, bd_addr, connect_int,BTIF_QUEUE_CONNECT_EVT);
+#else
     if(btif_av_cb.bta_handle)
        return btif_queue_connect(UUID_SERVCLASS_AUDIO_SOURCE, bd_addr, connect_int, BTIF_QUEUE_CONNECT_EVT);
     else
        return btif_queue_connect(UUID_SERVCLASS_AUDIO_SOURCE, bd_addr, connect_int, BTIF_QUEUE_PENDING_CONECT_EVT);
+#endif
 }
 
 /*******************************************************************************
@@ -871,7 +879,11 @@ static void cleanup(void)
     {
         btif_a2dp_stop_media_task();
 
+#ifdef A2DP_SINK
+        btif_disable_service(BTA_A2DP_SOURCE_SERVICE_ID);
+#else
         btif_disable_service(BTA_A2DP_SERVICE_ID);
+#endif
         bt_av_callbacks = NULL;
 
         /* Also shut down the AV state machine */

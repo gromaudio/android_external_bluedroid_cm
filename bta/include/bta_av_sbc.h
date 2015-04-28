@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -202,6 +203,19 @@ extern UINT8 bta_av_sbc_cfg_in_cap(UINT8 *p_cfg, tA2D_SBC_CIE *p_cap);
 **
 *******************************************************************************/
 extern void bta_av_sbc_bld_hdr(BT_HDR *p_buf, UINT16 fr_per_pkt);
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+**
+** Function         bta_av_sbc_prs_hdr
+**
+** Description      This function parses the packet header for MPF1.
+**
+** Returns          void
+**
+*******************************************************************************/
+extern void bta_av_sbc_prs_hdr(BT_HDR *p_buf, UINT16 *p_fr_per_pkt);
+#endif
 
 #endif /* BTA_AV_SBC_H */
 

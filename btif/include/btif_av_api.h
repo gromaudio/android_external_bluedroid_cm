@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -201,6 +202,24 @@ typedef struct
     tBTIF_AV_CODEC_ID format;        /* Media codec identifier */
     tBTIF_AV_MEDIA_FEED_CFG cfg;     /* Media codec configuration */
 } tBTIF_AV_MEDIA_FEEDINGS;
+
+#ifdef A2DP_SINK
+/**
+ * Structure used to configure the AV media receiving
+ */
+#ifndef tBTIF_AV_MEDIA_RECEIVE_CFG_PCM
+#define tBTIF_AV_MEDIA_RECEIVE_CFG_PCM tBTIF_AV_MEDIA_FEED_CFG_PCM
+#endif
+
+#ifndef tBTIF_AV_MEDIA_RECEIVE_CFG
+#define tBTIF_AV_MEDIA_RECEIVE_CFG tBTIF_AV_MEDIA_FEED_CFG
+#endif
+
+#ifndef tBTIF_AV_MEDIA_RECEIVINGS
+#define tBTIF_AV_MEDIA_RECEIVINGS tBTIF_AV_MEDIA_FEEDINGS
+#endif
+
+#endif /* A2DP_SINK */
 
 
 #ifdef __cplusplus

@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -151,6 +152,9 @@ typedef void (*tBTA_AV_NSM_ACT)(tBTA_AV_DATA *p_data);
 static void bta_av_api_enable(tBTA_AV_DATA *p_data);
 static void bta_av_api_register(tBTA_AV_DATA *p_data);
 static void bta_av_ci_data(tBTA_AV_DATA *p_data);
+#ifdef A2DP_SINK
+static void bta_av_ci_snk_data(tBTA_AV_DATA *p_data);
+#endif
 #if (AVDT_REPORTING == TRUE)
 static void bta_av_rpc_conn(tBTA_AV_DATA *p_data);
 #endif
@@ -169,6 +173,9 @@ const tBTA_AV_NSM_ACT bta_av_nsm_act[] =
     bta_av_api_deregister,  /* BTA_AV_API_DEREGISTER_EVT */
     bta_av_api_disconnect,  /* BTA_AV_API_DISCONNECT_EVT */
     bta_av_ci_data,         /* BTA_AV_CI_SRC_DATA_READY_EVT */
+#ifdef A2DP_SINK
+    bta_av_ci_snk_data,     /* BTA_AV_CI_SNK_DATA_READY_EVT */
+#endif
     bta_av_sig_chg,         /* BTA_AV_SIG_CHG_EVT */
     bta_av_sig_timer,       /* BTA_AV_SIG_TIMER_EVT */
     bta_av_rc_disc_done,    /* BTA_AV_SDP_AVRC_DISC_EVT */
@@ -455,6 +462,31 @@ static void bta_av_a2dp_report_cback(UINT8 handle, AVDT_REPORT_TYPE type,
 }
 #endif
 
+#ifdef A2DP_SINK
+/*******************************************************************************
+**
+** Function         bta_av_a2dp_data_cback
+**
+** Description      A2DP data callback is executed when AVDTP has a media packet
+**                  ready for the application. The function type is
+**                  tAVDT_DATA_CBACK.
+**
+** Returns          void
+**
+*******************************************************************************/
+static void bta_av_a2dp_data_cback(UINT8 handle, BT_HDR *p_pkt,
+                                   UINT32 time_stamp, UINT8 m_pt)
+{
+    /* send sink data ready msg to stream SM */
+    *((UINT32 *) (p_pkt + 1)) = time_stamp;
+    /* sequence number */
+    *((UINT16 *) (p_pkt + 1) + 2) = p_pkt->layer_specific;
+    p_pkt->layer_specific = BTA_AV_CHNL_AUDIO;
+    p_pkt->event = BTA_AV_CI_SNK_DATA_READY_EVT;
+    bta_sys_sendmsg(p_pkt);
+}
+#endif
+
 /*******************************************************************************
 **
 ** Function         bta_av_api_register
@@ -537,13 +569,20 @@ static void bta_av_api_register(tBTA_AV_DATA *p_data)
         /* get stream configuration and create stream */
         /* memset(&cs.cfg,0,sizeof(tAVDT_CFG)); */
         cs.cfg.num_codec = 1;
+#ifdef A2DP_SINK
+        cs.tsep = AVDT_TSEP_SNK;
+#else
         cs.tsep = AVDT_TSEP_SRC;
+#endif
 
         /*
          * memset of cs takes care setting call back pointers to null.
         cs.p_data_cback = NULL;
         cs.p_report_cback = NULL;
         */
+#ifdef A2DP_SINK
+        cs.p_data_cback = bta_av_a2dp_data_cback;
+#endif
         cs.nsc_mask = AVDT_NSC_RECONFIG |
               ((bta_av_cb.features & BTA_AV_FEAT_PROTECT) ? 0 : AVDT_NSC_SECURITY);
         APPL_TRACE_DEBUG1("nsc_mask: 0x%x", cs.nsc_mask);
@@ -605,9 +644,15 @@ static void bta_av_api_register(tBTA_AV_DATA *p_data)
             {
                 /* create the SDP records on the 1st audio channel */
                 bta_av_cb.sdp_a2d_handle = SDP_CreateRecord();
+#ifdef A2DP_SINK
+                A2D_AddRecord(UUID_SERVCLASS_AUDIO_SINK, p_service_name, NULL,
+                                  A2D_SUPF_SPEAKER, bta_av_cb.sdp_a2d_handle);
+                bta_sys_add_uuid(UUID_SERVCLASS_AUDIO_SINK);
+#else
                 A2D_AddRecord(UUID_SERVCLASS_AUDIO_SOURCE, p_service_name, NULL,
                                   A2D_SUPF_PLAYER, bta_av_cb.sdp_a2d_handle);
                 bta_sys_add_uuid(UUID_SERVCLASS_AUDIO_SOURCE);
+#endif
 
                 /* start listening when A2DP is registered */
                 if (bta_av_cb.features & BTA_AV_FEAT_RCTG)
@@ -704,6 +749,35 @@ static void bta_av_ci_data(tBTA_AV_DATA *p_data)
         }
     }
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+**
+** Function         bta_av_ci_snk_data
+**
+** Description      forward the BTA_AV_CI_SNK_DATA_READY_EVT to stream state machine
+**
+**
+** Returns          void
+**
+*******************************************************************************/
+static void bta_av_ci_snk_data(tBTA_AV_DATA *p_data)
+{
+    tBTA_AV_SCB *p_scb;
+    int     i;
+    UINT8   chnl = (UINT8)p_data->hdr.layer_specific;
+
+    for( i=0; i < BTA_AV_NUM_STRS; i++ )
+    {
+        p_scb = bta_av_cb.p_scb[i];
+
+        if(p_scb && p_scb->chnl == chnl)
+        {
+            bta_av_ssm_execute(p_scb, BTA_AV_SNK_DATA_READY_EVT, p_data);
+        }
+    }
+}
+#endif
 
 /*******************************************************************************
 **
@@ -1197,6 +1271,13 @@ BOOLEAN bta_av_hdl_event(BT_HDR *p_msg)
 #endif
         /* non state machine events */
         (*bta_av_nsm_act[event - BTA_AV_FIRST_NSM_EVT]) ((tBTA_AV_DATA *) p_msg);
+#ifdef A2DP_SINK
+        if (event == BTA_AV_CI_SNK_DATA_READY_EVT)
+        {
+            APPL_TRACE_DEBUG0("not to free p_msg, media task uses it directly to avoid memory copy");
+            return FALSE;
+        }
+#endif
     }
     else if (event >= BTA_AV_FIRST_SM_EVT && event <= BTA_AV_LAST_SM_EVT)
     {
@@ -1273,6 +1354,9 @@ char *bta_av_evt_code(UINT16 evt_code)
     case BTA_AV_API_PROTECT_RSP_EVT: return "API_PROTECT_RSP";
     case BTA_AV_API_RC_OPEN_EVT: return "API_RC_OPEN";
     case BTA_AV_SRC_DATA_READY_EVT: return "SRC_DATA_READY";
+#ifdef A2DP_SINK
+    case BTA_AV_SNK_DATA_READY_EVT: return "SNK_DATA_READY";
+#endif
     case BTA_AV_CI_SETCONFIG_OK_EVT: return "CI_SETCONFIG_OK";
     case BTA_AV_CI_SETCONFIG_FAIL_EVT: return "CI_SETCONFIG_FAIL";
     case BTA_AV_SDP_DISC_OK_EVT: return "SDP_DISC_OK";
@@ -1304,6 +1388,9 @@ char *bta_av_evt_code(UINT16 evt_code)
     case BTA_AV_API_DEREGISTER_EVT: return "API_DEREG";
     case BTA_AV_API_DISCONNECT_EVT: return "API_DISCNT";
     case BTA_AV_CI_SRC_DATA_READY_EVT: return "CI_DATA_READY";
+#ifdef A2DP_SINK
+    case BTA_AV_CI_SNK_DATA_READY_EVT: return "CI_SNK_DATA_READY";
+#endif
     case BTA_AV_SIG_CHG_EVT: return "SIG_CHG";
     case BTA_AV_SIG_TIMER_EVT: return "SIG_TMR";
     case BTA_AV_SDP_AVRC_DISC_EVT: return "SDP_AVRC_DISC";

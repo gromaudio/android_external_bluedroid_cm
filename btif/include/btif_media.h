@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -53,6 +54,9 @@
 /* Transcoding definition for TxTranscoding and RxTranscoding */
 #define BTIF_MEDIA_TRSCD_OFF             0
 #define BTIF_MEDIA_TRSCD_PCM_2_SBC       1  /* Tx */
+#ifdef A2DP_SINK
+#define BTIF_MEDIA_TRSCD_SBC_2_PCM       2  /* Rx */
+#endif
 
 
 /*******************************************************************************
@@ -90,6 +94,14 @@ typedef struct
         tBTIF_AV_FEEDING_MODE feeding_mode;
         tBTIF_AV_MEDIA_FEEDINGS feeding;
 } tBTIF_MEDIA_INIT_AUDIO_FEEDING;
+
+#ifdef A2DP_SINK
+typedef struct
+{
+        BT_HDR hdr;
+        tBTIF_AV_MEDIA_RECEIVINGS receiving;
+} tBTIF_MEDIA_INIT_AUDIO_RECEIVING;
+#endif
 #endif
 
 
@@ -118,6 +130,19 @@ extern int btif_media_task(void *p);
  **
  *******************************************************************************/
 extern BOOLEAN btif_media_task_enc_init_req(tBTIF_MEDIA_INIT_AUDIO * p_msg);
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_dec_init_req
+ **
+ ** Description      Request to initialize the media task decoder
+ **
+ ** Returns          TRUE is success
+ **
+ *******************************************************************************/
+extern BOOLEAN btif_media_task_dec_init_req(tBTIF_MEDIA_INIT_AUDIO * p_msg);
+#endif
 
 /*******************************************************************************
  **
@@ -210,8 +235,31 @@ extern BOOLEAN btif_media_av_writebuf(UINT8 *p_media, UINT32 media_len,
  ** Returns          TRUE is success
  **
  *******************************************************************************/
-
 extern BOOLEAN btif_media_task_audio_feeding_init_req(tBTIF_MEDIA_INIT_AUDIO_FEEDING *p_msg);
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_audio_receiving_init_req
+ **
+ ** Description      Request to initialize audio receiving
+ **
+ ** Returns          TRUE is success
+ **
+ *******************************************************************************/
+extern BOOLEAN btif_media_task_audio_receiving_init_req(tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_msg);
+
+/*******************************************************************************
+ ** Function         bt_media_aa_snk_data_ready
+ **
+ ** Descriptoin      This function sends an event to meida task that Advance Audio
+ **                  media GKI buffer is ready in receiving queue
+ **
+ ** Returns          void
+*******************************************************************************/
+extern void btif_media_aa_snk_data_ready(void);
+#endif
+
 #endif
 
 /*******************************************************************************

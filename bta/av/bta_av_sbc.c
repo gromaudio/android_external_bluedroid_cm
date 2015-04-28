@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -587,4 +588,18 @@ void bta_av_sbc_bld_hdr(BT_HDR *p_buf, UINT16 fr_per_pkt)
     p_buf->len += BTA_AV_SBC_HDR_SIZE;
     A2D_BldSbcMplHdr(p, FALSE, FALSE, FALSE, (UINT8) fr_per_pkt);
 }
+
+#ifdef A2DP_SINK
+void bta_av_sbc_prs_hdr(BT_HDR *p_buf, UINT16 *p_fr_per_pkt)
+{
+    BOOLEAN frag;
+    BOOLEAN start;
+    BOOLEAN last;
+
+    A2D_ParsSbcMplHdr((UINT8 *) (p_buf + 1) + p_buf->offset, &frag, &start,
+                      &last, (UINT8 *)p_fr_per_pkt);
+    p_buf->offset += BTA_AV_SBC_HDR_SIZE;
+    p_buf->len -= BTA_AV_SBC_HDR_SIZE;
+}
+#endif
 

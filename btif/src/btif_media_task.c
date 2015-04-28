@@ -2,6 +2,7 @@
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -58,6 +59,9 @@
 
 #if (BTA_AV_INCLUDED == TRUE)
 #include "sbc_encoder.h"
+#ifdef A2DP_SINK
+#include "sbc_decoder.h"
+#endif
 #endif
 
 #define LOG_TAG "BTIF-MEDIA"
@@ -232,6 +236,13 @@ typedef struct
     tBTIF_AV_MEDIA_FEEDINGS media_feeding;
     tBTIF_AV_MEDIA_FEEDINGS_STATE media_feeding_state;
     SBC_ENC_PARAMS encoder;
+#ifdef A2DP_SINK
+    BUFFER_Q RxAaQ;
+    UINT16 RxAaMtuSize;
+    UINT8 RxTranscoding;
+    tBTIF_AV_MEDIA_RECEIVINGS media_receiving;
+    SBC_DEC_PARAMS decoder;
+#endif
     UINT8 busy_level;
     void* av_sm_hdl;
     UINT8 a2dp_cmd_pending; /* we can have max one command pending */
@@ -284,6 +295,13 @@ static void btif_media_task_enc_update(BT_HDR *p_msg);
 static void btif_media_task_audio_feeding_init(BT_HDR *p_msg);
 static void btif_media_task_aa_tx_flush(BT_HDR *p_msg);
 static void btif_media_aa_prep_2_send(UINT8 nb_frame);
+#ifdef A2DP_SINK
+static void btif_media_task_dec_init(BT_HDR *p_msg);
+static void btif_media_task_audio_receiving_init(BT_HDR *p_msg);
+static void btif_media_aa_recv_frame(void);
+static void btif_media_aa_recv_sbc_frame(BT_HDR *p_buf);
+static BOOLEAN btif_media_aa_write_receiving(tUIPC_CH_ID channel_id);
+#endif
 #endif
 extern BOOLEAN btif_hf_is_call_idle();
 
@@ -587,11 +605,13 @@ static void btif_a2dp_data_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event)
                 connection events */
             UIPC_Ioctl(UIPC_CH_ID_AV_AUDIO, UIPC_REG_REMOVE_ACTIVE_READSET, NULL);
 
+            #ifndef A2DP_SINK
             /* Start the media task to encode SBC */
             btif_media_task_start_aa_req();
 
             /* make sure we update any changed sbc encoder params */
             btif_a2dp_encoder_update();
+            #endif
 
             /* ack back when media task is fully started */
             break;
@@ -606,6 +626,40 @@ static void btif_a2dp_data_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event)
             break;
     }
 }
+
+#ifdef A2DP_SINK
+static void btif_a2dp_decoder_init(void)
+{
+    UINT16 minmtu;
+    tBTIF_MEDIA_INIT_AUDIO msg;
+    tA2D_SBC_CIE sbc_config;
+
+    /* lookup table for converting channel mode */
+    UINT16 codec_mode_tbl[5] = { SBC_JOINT_STEREO, SBC_STEREO, SBC_DUAL, 0, SBC_MONO };
+
+    /* lookup table for converting number of blocks */
+    UINT16 codec_block_tbl[5] = { 16, 12, 8, 0, 4 };
+
+    /* lookup table to convert freq */
+    UINT16 freq_block_tbl[5] = { SBC_sf48000, SBC_sf44100, SBC_sf32000, 0, SBC_sf16000 };
+
+    APPL_TRACE_DEBUG0("btif_a2dp_decoder_init");
+
+    /* Retrieve the current SBC configuration (default if currently not used) */
+    bta_av_co_audio_get_sbc_config(&sbc_config, &minmtu);
+    msg.NumOfSubBands = (sbc_config.num_subbands == A2D_SBC_IE_SUBBAND_4) ? 4 : 8;
+    msg.NumOfBlocks = codec_block_tbl[sbc_config.block_len >> 5];
+    msg.AllocationMethod = (sbc_config.alloc_mthd == A2D_SBC_IE_ALLOC_MD_L) ? SBC_LOUDNESS : SBC_SNR;
+    msg.ChannelMode = codec_mode_tbl[sbc_config.ch_mode >> 1];
+    msg.SamplingFreq = freq_block_tbl[sbc_config.samp_freq >> 5];
+    msg.MtuSize = minmtu;
+
+    APPL_TRACE_EVENT1("msg.ChannelMode %x", msg.ChannelMode);
+
+    /* Init the media task to decode SBC properly */
+    btif_media_task_dec_init_req(&msg);
+}
+#endif
 
 
 /*****************************************************************************
@@ -784,6 +838,35 @@ void btif_a2dp_on_init(void)
 
 tBTIF_STATUS btif_a2dp_setup_codec(void)
 {
+#ifdef A2DP_SINK
+    tBTIF_AV_MEDIA_RECEIVINGS media_receiving;
+    tBTIF_STATUS status;
+
+    APPL_TRACE_EVENT0("## A2DP SETUP CODEC ##");
+
+    GKI_disable();
+
+    /* for now hardcode 44.1 khz 16 bit stereo PCM format */
+    media_receiving.cfg.pcm.sampling_freq = 44100;
+    media_receiving.cfg.pcm.bit_per_sample = 16;
+    media_receiving.cfg.pcm.num_channel = 2;
+    media_receiving.format = BTIF_AV_CODEC_SBC;
+
+    if (bta_av_co_audio_set_codec(&media_receiving, &status))
+    {
+        tBTIF_MEDIA_INIT_AUDIO_RECEIVING mReceive;
+
+        /* Init the decoding task */
+        btif_a2dp_decoder_init();
+
+        /* Build the media task configuration */
+        mReceive.receiving = media_receiving;
+        /* Send message to Media task to configure transcoding */
+        btif_media_task_audio_receiving_init_req(&mReceive);
+    }
+
+    GKI_enable();
+#else
     tBTIF_AV_MEDIA_FEEDINGS media_feeding;
     tBTIF_STATUS status;
 
@@ -816,6 +899,7 @@ tBTIF_STATUS btif_a2dp_setup_codec(void)
     }
 
     GKI_enable();
+#endif
     return status;
 }
 
@@ -1294,6 +1378,14 @@ static void btif_media_task_handle_cmd(BT_HDR *p_msg)
     case BTIF_MEDIA_UIPC_RX_RDY:
         btif_media_task_aa_handle_uipc_rx_rdy();
         break;
+#ifdef A2DP_SINK
+    case BTIF_MEDIA_SBC_DEC_INIT:
+        btif_media_task_dec_init(p_msg);
+        break;
+    case BTIF_MEDIA_AUDIO_RECEIVING_INIT:
+        btif_media_task_audio_receiving_init(p_msg);
+        break;
+#endif
 #endif
     default:
         APPL_TRACE_ERROR1("ERROR in btif_media_task_handle_cmd unknown event %d", p_msg->event);
@@ -1313,13 +1405,76 @@ static void btif_media_task_handle_cmd(BT_HDR *p_msg)
  *******************************************************************************/
 static void btif_media_task_handle_media(BT_HDR *p_msg)
 {
+#ifdef A2DP_SINK
+    APPL_TRACE_DEBUG0("btif_media_task_handle_media");
+    btif_media_aa_recv_frame();
+#else
     APPL_TRACE_ERROR0("ERROR btif_media_task_handle_media: not in use");
+#endif
 
     GKI_freebuf(p_msg);
 }
 
+#ifdef A2DP_SINK
+static void btif_media_aa_recv_frame(void)
+{
+    BT_HDR *p_buf;
 
+    p_buf = (BT_HDR *)GKI_dequeue(&(btif_media_cb.RxAaQ));
+    if (p_buf)
+    {
+        switch (btif_media_cb.RxTranscoding)
+        {
+        case BTIF_MEDIA_TRSCD_SBC_2_PCM:
+            btif_media_aa_recv_sbc_frame(p_buf);
+            break;
 
+        default:
+            APPL_TRACE_ERROR1("ERROR btif_media_aa_recv_frame unsupported transcoding format 0x%x",btif_media_cb.RxTranscoding);
+            GKI_freebuf(p_buf);
+            break;
+        }
+    }
+}
+
+static void btif_media_aa_recv_sbc_frame(BT_HDR *p_buf)
+{
+    /* call SBC decoder to decode SBC frames to 16bit PCM */
+    btif_media_cb.decoder.pu8Packet = (UINT8 *)(p_buf + 1) + p_buf->offset;
+    btif_media_cb.decoder.u16PacketLength = p_buf->len;
+    do
+    {
+        SBC_Decoder(&btif_media_cb.decoder);
+        if (btif_media_cb.decoder.s16SbcFrameLength < 1)
+        {
+            break;
+        }
+
+        btif_media_cb.decoder.pu8Packet +=
+                                        btif_media_cb.decoder.s16SbcFrameLength;
+        btif_media_cb.decoder.u16PacketLength -=
+                                        btif_media_cb.decoder.s16SbcFrameLength;
+
+        /* Write PCM data to upper layer */
+        if (!btif_media_aa_write_receiving(UIPC_CH_ID_AV_AUDIO))
+        {
+            APPL_TRACE_ERROR0("btif_media_aa_recv_sbc_frame failed to write PCM data");
+        }
+    } while (1);
+
+    GKI_freebuf(p_buf);
+}
+
+static BOOLEAN btif_media_aa_write_receiving(tUIPC_CH_ID channel_id)
+{
+    UINT16 event;
+
+    event = 0;
+    return UIPC_Send(channel_id, event,
+                     (UINT8 *)btif_media_cb.decoder.as16SbBuffer,
+                     btif_media_cb.decoder.s16PcmLength);
+}
+#endif
 
 #if (BTA_AV_INCLUDED == TRUE)
 /*******************************************************************************
@@ -1346,6 +1501,32 @@ BOOLEAN btif_media_task_enc_init_req(tBTIF_MEDIA_INIT_AUDIO *p_msg)
     return TRUE;
 }
 
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_dec_init_req
+ **
+ ** Description
+ **
+ ** Returns          TRUE is success
+ **
+ *******************************************************************************/
+BOOLEAN btif_media_task_dec_init_req(tBTIF_MEDIA_INIT_AUDIO *p_msg)
+{
+    tBTIF_MEDIA_INIT_AUDIO *p_buf;
+    if (NULL == (p_buf = GKI_getbuf(sizeof(tBTIF_MEDIA_INIT_AUDIO))))
+    {
+        return FALSE;
+    }
+
+    memcpy(p_buf, p_msg, sizeof(tBTIF_MEDIA_INIT_AUDIO));
+    p_buf->hdr.event = BTIF_MEDIA_SBC_DEC_INIT;
+
+    GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
+    return TRUE;
+}
+#endif
+
 /*******************************************************************************
  **
  ** Function         btif_media_task_enc_update_req
@@ -1369,6 +1550,32 @@ BOOLEAN btif_media_task_enc_update_req(tBTIF_MEDIA_UPDATE_AUDIO *p_msg)
     GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
     return TRUE;
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_audio_receiving_init_req
+ **
+ ** Description
+ **
+ ** Returns          TRUE is success
+ **
+ *******************************************************************************/
+BOOLEAN btif_media_task_audio_receiving_init_req(tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_msg)
+{
+    tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_buf;
+    if (NULL == (p_buf = GKI_getbuf(sizeof(tBTIF_MEDIA_INIT_AUDIO_RECEIVING))))
+    {
+        return FALSE;
+    }
+
+    memcpy(p_buf, p_msg, sizeof(tBTIF_MEDIA_INIT_AUDIO_RECEIVING));
+    p_buf->hdr.event = BTIF_MEDIA_AUDIO_RECEIVING_INIT;
+
+    GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
+    return TRUE;
+}
+#endif
 
 /*******************************************************************************
  **
@@ -1527,6 +1734,38 @@ static void btif_media_task_enc_init(BT_HDR *p_msg)
     SBC_Encoder_Init(&(btif_media_cb.encoder));
     APPL_TRACE_DEBUG1("btif_media_task_enc_init bit pool %d", btif_media_cb.encoder.s16BitPool);
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function       btif_media_task_dec_init
+ **
+ ** Description    Initialize decoding task
+ **
+ ** Returns        void
+ **
+ *******************************************************************************/
+static void btif_media_task_dec_init(BT_HDR *p_msg)
+{
+    tBTIF_MEDIA_INIT_AUDIO *pInitAudio = (tBTIF_MEDIA_INIT_AUDIO *) p_msg;
+
+    APPL_TRACE_DEBUG0("btif_media_task_dec_init");
+
+    btif_media_cb.timestamp = 0;
+
+    /* Default transcoding is SBC to PCM, modified by receiving configuration */
+    btif_media_cb.RxTranscoding = BTIF_MEDIA_TRSCD_SBC_2_PCM;
+    btif_media_cb.RxAaMtuSize = ((BTIF_MEDIA_AA_BUF_SIZE-BTIF_MEDIA_AA_SBC_OFFSET-sizeof(BT_HDR))
+            < pInitAudio->MtuSize) ? (BTIF_MEDIA_AA_BUF_SIZE - BTIF_MEDIA_AA_SBC_OFFSET
+            - sizeof(BT_HDR)) : pInitAudio->MtuSize;
+
+    APPL_TRACE_EVENT3("btif_media_task_dec_init busy %d, mtu %d, peer mtu %d",
+                     btif_media_cb.busy_level, btif_media_cb.RxAaMtuSize, pInitAudio->MtuSize);
+
+    /* Reset entirely the SBC decoder */
+    SBC_Decoder_Init(&(btif_media_cb.decoder));
+}
+#endif
 
 static UINT16 btif_media_task_get_min_high_bp_avdtp_mtu(UINT16 freq)
 {
@@ -1784,6 +2023,87 @@ static void btif_media_task_pcm2sbc_init(tBTIF_MEDIA_INIT_AUDIO_FEEDING * p_feed
     }
 }
 
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_sbc2pcm_init
+ **
+ ** Description      Init decoding task for SBC to PCM according to receiving
+ **
+ ** Returns          void
+ **
+ *******************************************************************************/
+static void btif_media_task_sbc2pcm_init(tBTIF_MEDIA_INIT_AUDIO_RECEIVING * p_receiving)
+{
+    BOOLEAN reconfig_needed = FALSE;
+
+    APPL_TRACE_DEBUG0("SBC receiving:");
+    APPL_TRACE_DEBUG1("sampling_freq:%d", p_receiving->receiving.cfg.pcm.sampling_freq);
+    APPL_TRACE_DEBUG1("num_channel:%d", p_receiving->receiving.cfg.pcm.num_channel);
+    APPL_TRACE_DEBUG1("bit_per_sample:%d", p_receiving->receiving.cfg.pcm.bit_per_sample);
+#if 0
+    /* Check the SBC receiving sampling_freq */
+    switch (p_receiving->receiving.cfg.pcm.sampling_freq)
+    {
+        case  8000:
+        case 12000:
+        case 16000:
+        case 24000:
+        case 32000:
+        case 48000:
+            /* For these sampling_freq the AV connection must be 48000 */
+            if (btif_media_cb.decoder.s16SamplingFreq != SBC_sf48000)
+            {
+                /* Reconfiguration needed at 48000 */
+                APPL_TRACE_DEBUG0("SBC Reconfiguration needed at 48000");
+                btif_media_cb.decoder.s16SamplingFreq = SBC_sf48000;
+                reconfig_needed = TRUE;
+            }
+            break;
+
+        case 11025:
+        case 22050:
+        case 44100:
+            /* For these sampling_freq the AV connection must be 44100 */
+            if (btif_media_cb.decoder.s16SamplingFreq != SBC_sf44100)
+            {
+                /* Reconfiguration needed at 44100 */
+                APPL_TRACE_DEBUG0("SBC Reconfiguration needed at 44100");
+                btif_media_cb.decoder.s16SamplingFreq = SBC_sf44100;
+                reconfig_needed = TRUE;
+            }
+            break;
+        default:
+            APPL_TRACE_DEBUG0("Receiving SBC sampling_freq unsupported");
+            break;
+    }
+
+    /* Some AV Headsets do not support Mono => always ask for Stereo */
+    if (btif_media_cb.decoder.s16ChannelMode == SBC_MONO)
+    {
+        APPL_TRACE_DEBUG0("SBC Reconfiguration needed in Stereo");
+        btif_media_cb.decoder.s16ChannelMode = SBC_JOINT_STEREO;
+        reconfig_needed = TRUE;
+    }
+
+    if (reconfig_needed != FALSE)
+    {
+        APPL_TRACE_DEBUG1("btif_media_task_sbc2pcm_init :: mtu %d", btif_media_cb.RxAaMtuSize);
+        APPL_TRACE_DEBUG6("ch mode %d, nbsubd %d, nb %d, alloc %d, rate %d, freq %d",
+                btif_media_cb.decoder.s16ChannelMode,
+                btif_media_cb.decoder.s16NumOfSubBands, btif_media_cb.decoder.s16NumOfBlocks,
+                btif_media_cb.decoder.s16AllocationMethod, btif_media_cb.decoder.u16BitRate,
+                btif_media_cb.decoder.s16SamplingFreq);
+
+        SBC_Decoder_Init(&(btif_media_cb.decoder));
+    }
+    else
+#endif
+    {
+        APPL_TRACE_DEBUG0("btif_media_task_sbc2pcm_init no SBC reconfig needed");
+    }
+}
+#endif
 
 /*******************************************************************************
  **
@@ -1817,6 +2137,40 @@ static void btif_media_task_audio_feeding_init(BT_HDR *p_msg)
             break;
     }
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ **
+ ** Function         btif_media_task_audio_receiving_init
+ **
+ ** Description      Initialize the audio path according to the receiving format
+ **
+ ** Returns          void
+ **
+ *******************************************************************************/
+static void btif_media_task_audio_receiving_init(BT_HDR *p_msg)
+{
+    tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_receiving = (tBTIF_MEDIA_INIT_AUDIO_RECEIVING *) p_msg;
+
+    APPL_TRACE_DEBUG1("btif_media_task_audio_receiving_init format:%d", p_receiving->receiving.format);
+
+    /* Save Media Receiving information */
+    btif_media_cb.media_receiving = p_receiving->receiving;
+
+    /* Handle different receiving formats */
+    switch (p_receiving->receiving.format)
+    {
+        case BTIF_AV_CODEC_SBC:
+            btif_media_cb.RxTranscoding = BTIF_MEDIA_TRSCD_SBC_2_PCM;
+            btif_media_task_sbc2pcm_init(p_receiving);
+            break;
+
+        default :
+            APPL_TRACE_ERROR1("unknown receiving format %d", p_receiving->receiving.format);
+            break;
+    }
+}
+#endif
 
 /*******************************************************************************
  **
@@ -2020,6 +2374,42 @@ BT_HDR *btif_media_aa_readbuf(void)
 {
     return GKI_dequeue(&(btif_media_cb.TxAaQ));
 }
+
+#ifdef A2DP_SINK
+/*******************************************************************************
+ ** Function         btif_media_aa_writebuf
+ **
+ ** Description      Enqueue an Advance Audio media GKI buffer to be processed by btif media task
+ **
+ **
+ ** Returns          void
+*******************************************************************************/
+void btif_media_aa_writebuf(BT_HDR *p_buf, UINT32 timestamp, UINT16 seq_num)
+{
+    GKI_enqueue(&(btif_media_cb.RxAaQ), p_buf);
+}
+
+/*******************************************************************************
+ ** Function         bt_media_aa_snk_data_ready
+ **
+ ** Descriptoin      This function sends an event to meida task that Advance Audio
+ **                  media GKI buffer is ready in receiving queue
+ **
+ ** Returns          void
+*******************************************************************************/
+void btif_media_aa_snk_data_ready(void)
+{
+    BT_HDR *p_buf;
+
+    p_buf = GKI_getbuf(sizeof(BT_HDR));
+    if (p_buf)
+    {
+        p_buf->event = BTIF_MEDIA_AA_RX_RDY;
+
+        GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_DATA_MBOX, p_buf);
+    }
+}
+#endif
 
 /*******************************************************************************
  **

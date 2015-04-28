@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -1996,7 +1997,11 @@ void bta_av_dereg_comp(tBTA_AV_DATA *p_data)
                 bta_ar_dereg_avrc (UUID_SERVCLASS_AV_REMOTE_CONTROL, BTA_ID_AV);
 #endif
                 bta_av_del_sdp_rec(&p_cb->sdp_a2d_handle);
+#ifdef A2DP_SINK
+                bta_sys_remove_uuid(UUID_SERVCLASS_AUDIO_SINK);
+#else
                 bta_sys_remove_uuid(UUID_SERVCLASS_AUDIO_SOURCE);
+#endif
             }
         }
         else

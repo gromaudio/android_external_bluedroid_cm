@@ -3,6 +3,7 @@
  *  Copyright (c) 2013, The Linux Foundation. All rights reserved.
  *  Not a Contribution.
  *  Copyright (C) 2009-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -168,6 +169,9 @@ bt_status_t btif_in_execute_service_request(tBTA_SERVICE_ID service_id,
          {
               btif_hf_execute_service(b_enable);
          }break;
+#ifdef A2DP_SINK
+         case BTA_A2DP_SOURCE_SERVICE_ID:
+#endif
          case BTA_A2DP_SERVICE_ID:
          {
               btif_av_execute_service(b_enable);

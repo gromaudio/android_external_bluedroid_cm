@@ -2,6 +2,7 @@
  *
  *  Copyright (C) 2009-2012 Broadcom Corporation
  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,7 +37,6 @@
 /*****************************************************************************
 **  Constants & Macros
 ******************************************************************************/
-
 #define A2DP_AUDIO_HARDWARE_INTERFACE "audio.a2dp"
 #define A2DP_CTRL_PATH "/data/misc/bluedroid/.a2dp_ctrl"
 #define A2DP_DATA_PATH "/data/misc/bluedroid/.a2dp_data"
@@ -49,6 +49,10 @@
 #define AUDIO_STREAM_DEFAULT_FORMAT        AUDIO_FORMAT_PCM_16_BIT
 #define AUDIO_STREAM_DEFAULT_CHANNEL_FLAG  AUDIO_CHANNEL_OUT_STEREO
 #define AUDIO_STREAM_OUTPUT_BUFFER_SZ      (20*512)
+#ifdef A2DP_SINK
+#define AUDIO_STREAM_DEFAULT_INPUT_CHANNEL_FLAG  AUDIO_CHANNEL_IN_STEREO
+#define AUDIO_STREAM_INPUT_BUFFER_SZ             (20*512)
+#endif
 #define AUDIO_SKT_DISCONNECTED             (-1)
 
 typedef enum {

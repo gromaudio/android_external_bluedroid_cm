@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2003-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -309,6 +310,20 @@ BTA_API extern void bta_av_co_video_stop(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_
 *******************************************************************************/
 BTA_API extern void * bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type,
                                                     UINT32 *p_len, UINT32 *p_timestamp);
+#ifdef A2DP_SINK
+/*******************************************************************************
+**
+** Function         bta_av_co_audio_snk_data_path
+**
+** Description      This function is called to put the next data buffer into
+**                  the audio codec
+**
+** Returns          TRUE-successful, FALSE-failed
+**
+*******************************************************************************/
+BTA_API extern BOOLEAN bta_av_co_audio_snk_data_path(tBTA_AV_CODEC codec_type,
+                                                  BT_HDR *p_buf);
+#endif
 
 /*******************************************************************************
 **

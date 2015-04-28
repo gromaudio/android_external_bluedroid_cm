@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -74,6 +75,9 @@ enum
     BTA_AV_STR_STOPPED,
     BTA_AV_RECONFIG,
     BTA_AV_DATA_PATH,
+#ifdef A2DP_SINK
+    BTA_AV_SNK_DATA_PATH,
+#endif
     BTA_AV_START_OK,
     BTA_AV_START_FAILED,
     BTA_AV_STR_CLOSED,
@@ -121,6 +125,9 @@ static const UINT8 bta_av_sst_init[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
@@ -161,6 +168,9 @@ static const UINT8 bta_av_sst_incoming[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SETCONFIG_RSP,  BTA_AV_ST_RC_TIMER,    BTA_AV_INCOMING_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SETCONFIG_RSP,  BTA_AV_CLEANUP,        BTA_AV_INIT_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
@@ -201,6 +211,9 @@ static const UINT8 bta_av_sst_opening[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_CONNECT_REQ,    BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
@@ -241,6 +254,9 @@ static const UINT8 bta_av_sst_open[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SET_USE_RC,     BTA_AV_OPEN_RC,        BTA_AV_OPEN_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_DATA_PATH,      BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SNK_DATA_PATH,  BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
@@ -281,6 +297,9 @@ static const UINT8 bta_av_sst_rcfg[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
@@ -321,6 +340,9 @@ static const UINT8 bta_av_sst_closing[][BTA_AV_NUM_COLS] =
 /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
 /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
 /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+#ifdef A2DP_SINK
+/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+#endif
 /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
 /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
 /* SDP_DISC_OK_EVT */       {BTA_AV_SDP_FAILED,     BTA_AV_SIGNORE,        BTA_AV_INIT_SST },

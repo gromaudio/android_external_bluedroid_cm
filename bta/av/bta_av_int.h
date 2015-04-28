@@ -1,6 +1,7 @@
 /******************************************************************************
  *
  *  Copyright (C) 2004-2012 Broadcom Corporation
+ *  Copyright (C) 2014 Tieto Corporation
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -58,6 +59,9 @@ enum
     BTA_AV_API_PROTECT_RSP_EVT,
     BTA_AV_API_RC_OPEN_EVT,
     BTA_AV_SRC_DATA_READY_EVT,
+#ifdef A2DP_SINK
+    BTA_AV_SNK_DATA_READY_EVT,
+#endif
     BTA_AV_CI_SETCONFIG_OK_EVT,
     BTA_AV_CI_SETCONFIG_FAIL_EVT,
     BTA_AV_SDP_DISC_OK_EVT,
@@ -90,6 +94,9 @@ enum
     BTA_AV_API_DEREGISTER_EVT,
     BTA_AV_API_DISCONNECT_EVT,
     BTA_AV_CI_SRC_DATA_READY_EVT,
+#ifdef A2DP_SINK
+    BTA_AV_CI_SNK_DATA_READY_EVT,
+#endif
     BTA_AV_SIG_CHG_EVT,
     BTA_AV_SIG_TIMER_EVT,
     BTA_AV_SDP_AVRC_DISC_EVT,
@@ -174,6 +181,10 @@ typedef void (*tBTA_AV_CO_START) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,UI
 typedef void (*tBTA_AV_CO_STOP) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type);
 typedef void * (*tBTA_AV_CO_DATAPATH) (tBTA_AV_CODEC codec_type,
                                        UINT32 *p_len, UINT32 *p_timestamp);
+#ifdef A2DP_SINK
+typedef BOOLEAN (*tBTA_AV_CO_SNK_DATAPATH) (tBTA_AV_CODEC codec_type,
+                                            BT_HDR *p_buf);
+#endif
 typedef void (*tBTA_AV_CO_DELAY) (tBTA_AV_HNDL hndl, UINT16 delay);
 
 /* the call-out functions for one stream */
@@ -188,6 +199,9 @@ typedef struct
     tBTA_AV_CO_START    start;
     tBTA_AV_CO_STOP     stop;
     tBTA_AV_CO_DATAPATH data;
+#ifdef A2DP_SINK
+    tBTA_AV_CO_SNK_DATAPATH snk_data;
+#endif
     tBTA_AV_CO_DELAY    delay;
 } tBTA_AV_CO_FUNCTS;
 
@@ -687,6 +701,9 @@ extern void bta_av_do_start (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
 extern void bta_av_str_stopped (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
 extern void bta_av_reconfig (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
 extern void bta_av_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+#ifdef A2DP_SINK
+extern void bta_av_snk_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+#endif
 extern void bta_av_start_ok (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
 extern void bta_av_start_failed (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
 extern void bta_av_str_closed (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);

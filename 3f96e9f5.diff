@@ -1,0 +1,2210 @@
+From 3f96e9f585300a499a29742cdb979451535e38c6 Mon Sep 17 00:00:00 2001
+From: Wenjie Gong <wenjie.gong@tieto.com>
+Date: Thu, 12 Jun 2014 10:55:32 +0800
+Subject: [PATCH] Bluetooth A2DP Sink
+
+The change implements the A2DP sink feature.
+If the android device is a sink role, it can receive music from phone
+via BT. This feature can be apply in multimedia car kit, set-top box
+and family HiFi.
+Set BLUETOOTH_A2DP_SINK := true in BoardConfig.mk to enable A2DP Sink
+featue in bluedroid.
+
+You also need the changes below in framework to route music to
+speaker.
+https://android-review.googlesource.com/#/c/97832/
+https://android-review.googlesource.com/#/c/97853/
+https://android-review.googlesource.com/#/c/97833/
+https://android-review.googlesource.com/#/c/98130/
+https://android-review.googlesource.com/#/c/98131/
+
+This change does not include SBC decoder. You can get a SBC decoder
+from github.com/tieto/sbc-decoder.
+
+Change-Id: I703237ebf1d8036d365b00d2ed79503a72ff3bb3
+---
+
+diff --git a/Android.mk b/Android.mk
+index 9e197f0..91f9046 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -11,6 +11,10 @@
+   bdroid_CFLAGS := -DHAS_NO_BDROID_BUILDCFG
+ endif
+ 
++ifeq ($(BLUETOOTH_A2DP_SINK),true)
++  bdroid_CFLAGS += -DA2DP_SINK
++endif
++
+ include $(call all-subdir-makefiles)
+ 
+ # Cleanup our locals
+diff --git a/audio_a2dp_hw/Android.mk b/audio_a2dp_hw/Android.mk
+index 172fba3..6ae15f1 100644
+--- a/audio_a2dp_hw/Android.mk
++++ b/audio_a2dp_hw/Android.mk
+@@ -25,3 +25,7 @@
++ifeq ($(BLUETOOTH_A2DP_SINK),true)
++LOCAL_CFLAGS += -DA2DP_SINK
++endif
++
+ LOCAL_MODULE := audio.a2dp.default
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+ 
+diff --git a/audio_a2dp_hw/audio_a2dp_hw.c b/audio_a2dp_hw/audio_a2dp_hw.c
+index fac94a4..1a4b0ca 100644
+--- a/audio_a2dp_hw/audio_a2dp_hw.c
++++ b/audio_a2dp_hw/audio_a2dp_hw.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -79,10 +80,16 @@
+ } a2dp_state_t;
+ 
+ struct a2dp_stream_out;
++#ifdef A2DP_SINK
++struct a2dp_stream_in;
++#endif
+ 
+ struct a2dp_audio_device {
+     struct audio_hw_device device;
+     struct a2dp_stream_out *output;
++#ifdef A2DP_SINK
++    struct a2dp_stream_in  *input;
++#endif
+ };
+ 
+ struct a2dp_config {
+@@ -105,6 +112,14 @@
+ 
+ struct a2dp_stream_in {
+     struct audio_stream_in stream;
++#ifdef A2DP_SINK
++    pthread_mutex_t        lock;
++    int                    ctrl_fd;
++    int                    audio_fd;
++    size_t                 buffer_sz;
++    a2dp_state_t           state;
++    struct a2dp_config     cfg;
++#endif
+ };
+ 
+ /*****************************************************************************
+@@ -217,6 +232,39 @@
+     return skt_fd;
+ }
+ 
++#ifdef A2DP_SINK
++static int skt_connect_in(struct a2dp_stream_in *in, char *path)
++{
++    int ret;
++    int skt_fd;
++    struct sockaddr_un remote;
++    int len;
++
++    INFO("connect to %s (sz %d)", path, in->buffer_sz);
++
++    skt_fd = socket(AF_LOCAL, SOCK_STREAM, 0);
++
++    if(socket_local_client_connect(skt_fd, path,
++            ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_STREAM) < 0)
++    {
++        ERROR("failed to connect (%s)", strerror(errno));
++        close(skt_fd);
++        return -1;
++    }
++
++    len = in->buffer_sz;
++    ret = setsockopt(skt_fd, SOL_SOCKET, SO_SNDBUF, (char*)&len, (int)sizeof(len));
++
++    /* only issue warning if failed */
++    if (ret < 0)
++        ERROR("setsockopt failed (%s)", strerror(errno));
++
++    INFO("connected to stack fd = %d", skt_fd);
++
++    return skt_fd;
++}
++#endif
++
+ static int skt_write(int fd, const void *p, size_t len)
+ {
+     int sent;
+@@ -243,6 +291,34 @@
+ 
+     return sent;
+ }
++
++#ifdef A2DP_SINK
++static int skt_read(int fd, void *p, size_t len)
++{
++    int recved;
++    struct pollfd pfd;
++
++    FNLOG();
++
++    pfd.fd = fd;
++    pfd.events = POLLOUT;
++
++    /* poll for 500 ms */
++    /* recv time out */
++    if (poll(&pfd, 1, 500) == 0)
++        return 0;
++
++    ts_log("skt_read", len, NULL);
++
++    if ((recved = recv(fd, p, len, MSG_NOSIGNAL)) == -1)
++    {
++        ERROR("read failed with errno=%d\n", errno);
++        return -1;
++    }
++
++    return recved;
++}
++#endif
+ 
+ static int skt_disconnect(int fd)
+ {
+@@ -296,6 +372,40 @@
+     return 0;
+ }
+ 
++#ifdef A2DP_SINK
++static int a2dp_command_in(struct a2dp_stream_in *in, char cmd)
++{
++    char ack;
++
++    DEBUG("A2DP COMMAND %s", dump_a2dp_ctrl_event(cmd));
++
++    /* send command */
++    if (send(in->ctrl_fd, &cmd, 1, MSG_NOSIGNAL) == -1)
++    {
++        ERROR("cmd failed (%s)", strerror(errno));
++        skt_disconnect(in->ctrl_fd);
++        in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
++        return -1;
++    }
++
++    /* wait for ack byte */
++    if (recv(in->ctrl_fd, &ack, 1, MSG_NOSIGNAL) < 0)
++    {
++        ERROR("ack failed (%s)", strerror(errno));
++        skt_disconnect(in->ctrl_fd);
++        in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
++        return -1;
++    }
++
++    DEBUG("A2DP COMMAND %s DONE STATUS %d", dump_a2dp_ctrl_event(cmd), ack);
++
++    if (ack != A2DP_CTRL_ACK_SUCCESS)
++        return -1;
++
++    return 0;
++}
++#endif
++
+ /*****************************************************************************
+ **
+ ** AUDIO DATA PATH
+@@ -323,6 +433,30 @@
+     /* manages max capacity of socket pipe */
+     out->buffer_sz = AUDIO_STREAM_OUTPUT_BUFFER_SZ;
+ }
++
++#ifdef A2DP_SINK
++static void a2dp_stream_in_init(struct a2dp_stream_in *in)
++{
++    pthread_mutexattr_t lock_attr;
++
++    FNLOG();
++
++    pthread_mutexattr_init(&lock_attr);
++    pthread_mutexattr_settype(&lock_attr, PTHREAD_MUTEX_RECURSIVE);
++    pthread_mutex_init(&in->lock, &lock_attr);
++
++    in->ctrl_fd = AUDIO_SKT_DISCONNECTED;
++    in->audio_fd = AUDIO_SKT_DISCONNECTED;
++    in->state = AUDIO_A2DP_STATE_STOPPED;
++
++    in->cfg.channel_flags = AUDIO_STREAM_DEFAULT_INPUT_CHANNEL_FLAG;
++    in->cfg.format = AUDIO_STREAM_DEFAULT_FORMAT;
++    in->cfg.rate = AUDIO_STREAM_DEFAULT_RATE;
++
++    /* manages max capacity of socket pipe */
++    in->buffer_sz = AUDIO_STREAM_INPUT_BUFFER_SZ;
++}
++#endif
+ 
+ static int start_audio_datapath(struct a2dp_stream_out *out)
+ {
+@@ -402,6 +494,43 @@
+     return 0;
+ }
+ 
++#ifdef A2DP_SINK
++static int start_audio_in_datapath(struct a2dp_stream_in *in)
++{
++    int oldstate = in->state;
++
++    INFO("state %d", in->state);
++
++    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
++        return -1;
++
++    in->state = AUDIO_A2DP_STATE_STARTING;
++
++    if (a2dp_command_in(in, A2DP_CTRL_CMD_START) < 0)
++    {
++        ERROR("audio-in-path start failed");
++
++        in->state = oldstate;
++        return -1;
++    }
++
++    /* connect socket if not yet connected */
++    if (in->audio_fd == AUDIO_SKT_DISCONNECTED)
++    {
++        in->audio_fd = skt_connect_in(in, A2DP_DATA_PATH);
++
++        if (in->audio_fd < 0)
++        {
++            in->state = oldstate;
++            return -1;
++        }
++
++        in->state = AUDIO_A2DP_STATE_STARTED;
++    }
++
++    return 0;
++}
++#endif
+ 
+ static int stop_audio_datapath(struct a2dp_stream_out *out)
+ {
+@@ -416,6 +587,34 @@
+     return 0;
+ }
+ 
++#ifdef A2DP_SINK
++static int suspend_audio_in_datapath(struct a2dp_stream_in *in, bool standby)
++{
++    INFO("state %d", in->state);
++
++    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
++         return -1;
++
++    if (in->state == AUDIO_A2DP_STATE_STOPPING)
++        return -1;
++
++    if (a2dp_command_in(in, A2DP_CTRL_CMD_SUSPEND) < 0)
++        return -1;
++
++    if (standby)
++        in->state = AUDIO_A2DP_STATE_STANDBY;
++    else
++        in->state = AUDIO_A2DP_STATE_SUSPENDED;
++
++    /* disconnect audio path */
++    skt_disconnect(in->audio_fd);
++
++    in->audio_fd = AUDIO_SKT_DISCONNECTED;
++
++    return 0;
++}
++#endif
++
+ static int check_a2dp_ready(struct a2dp_stream_out *out)
+ {
+     INFO("state %d", out->state);
+@@ -493,6 +727,19 @@
+    return 0;
+ }
+ 
++#ifdef A2DP_SINK
++static int check_a2dp_ready_in(struct a2dp_stream_in *in)
++{
++    INFO("state %d", in->state);
++
++    if (a2dp_command_in(in, A2DP_CTRL_CMD_CHECK_READY) < 0)
++    {
++        ERROR("check a2dp ready failed");
++        return -1;
++    }
++    return 0;
++}
++#endif
+ 
+ /*****************************************************************************
+ **
+@@ -692,44 +904,115 @@
+ 
+ static uint32_t in_get_sample_rate(const struct audio_stream *stream)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++
++    DEBUG("rate %d", in->cfg.rate);
++
++    return in->cfg.rate;
++#else
+     FNLOG();
+     return 8000;
++#endif
+ }
+ 
+ static int in_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++
++    DEBUG("in_set_sample_rate : %d", rate);
++
++    if (rate != AUDIO_STREAM_DEFAULT_RATE)
++    {
++        ERROR("only rate %d supported", AUDIO_STREAM_DEFAULT_RATE);
++        return -1;
++    }
++
++    in->cfg.rate = rate;
++
++    return 0;
++#else
+     FNLOG();
+     return 0;
++#endif
+ }
+ 
+ static size_t in_get_buffer_size(const struct audio_stream *stream)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++
++    DEBUG("buffer_size : %d", in->buffer_sz);
++
++    return in->buffer_sz;
++#else
+     FNLOG();
+     return 320;
++#endif
+ }
+ 
+ static uint32_t in_get_channels(const struct audio_stream *stream)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++
++    DEBUG("channels 0x%x", in->cfg.channel_flags);
++
++    return in->cfg.channel_flags;
++#else
+     FNLOG();
+     return AUDIO_CHANNEL_IN_MONO;
++#endif
+ }
+ 
+ static audio_format_t in_get_format(const struct audio_stream *stream)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++
++    DEBUG("format 0x%x", in->cfg.format);
++
++    return in->cfg.format;
++#else
+     FNLOG();
+     return AUDIO_FORMAT_PCM_16_BIT;
++#endif
+ }
+ 
+ static int in_set_format(struct audio_stream *stream, audio_format_t format)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++    DEBUG("setting format not yet supported (0x%x)", format);
++    return -ENOSYS;
++#else
+     FNLOG();
+     return 0;
++#endif
+ }
+ 
+ static int in_standby(struct audio_stream *stream)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++    int retVal = 0;
++
++    FNLOG();
++
++    pthread_mutex_lock(&in->lock);
++
++    if (in->state == AUDIO_A2DP_STATE_STARTED)
++        retVal =  suspend_audio_in_datapath(in, true);
++    else
++        retVal = 0;
++    pthread_mutex_unlock (&in->lock);
++
++    return retVal;
++#else
+     FNLOG();
+     return 0;
++#endif
+ }
+ 
+ static int in_dump(const struct audio_stream *stream, int fd)
+@@ -760,8 +1043,61 @@
+ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
+                        size_t bytes)
+ {
++#ifdef A2DP_SINK
++    struct a2dp_stream_in *in = (struct a2dp_stream_in *)stream;
++    int recved;
++
++    DEBUG("read %d bytes (fd %d)", bytes, in->audio_fd);
++
++    if (in->state == AUDIO_A2DP_STATE_SUSPENDED)
++    {
++        DEBUG("stream suspended");
++        return -1;
++    }
++
++    /* only allow autostarting if we are in stopped or standby */
++    if ((in->state == AUDIO_A2DP_STATE_STOPPED) ||
++        (in->state == AUDIO_A2DP_STATE_STANDBY))
++    {
++        pthread_mutex_lock(&in->lock);
++
++        if (start_audio_in_datapath(in) < 0)
++        {
++            /* emulate time this read represents to avoid very fast read
++               failures during transition periods or remote suspend */
++
++            int us_delay = calc_audiotime(in->cfg, bytes);
++
++            DEBUG("emulate a2dp read delay (%d us)", us_delay);
++
++            usleep(us_delay);
++            pthread_mutex_unlock(&in->lock);
++            return -1;
++        }
++
++        pthread_mutex_unlock(&in->lock);
++    }
++    else if (in->state != AUDIO_A2DP_STATE_STARTED)
++    {
++        ERROR("stream not in stopped or standby");
++        return -1;
++    }
++
++    recved = skt_read(in->audio_fd, buffer, bytes);
++
++    if (recved == -1)
++    {
++        skt_disconnect(in->audio_fd);
++        in->audio_fd = AUDIO_SKT_DISCONNECTED;
++        in->state = AUDIO_A2DP_STATE_STOPPED;
++    }
++
++    DEBUG("read %d bytes out of %d bytes", recved, bytes);
++    return recved;
++#else
+     FNLOG();
+     return bytes;
++#endif
+ }
+ 
+ static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
+@@ -980,6 +1316,7 @@
+     struct a2dp_audio_device *ladev = (struct a2dp_audio_device *)dev;
+     struct a2dp_stream_in *in;
+     int ret;
++    int i;
+ 
+     FNLOG();
+ 
+@@ -1004,12 +1341,55 @@
+     in->stream.read = in_read;
+     in->stream.get_input_frames_lost = in_get_input_frames_lost;
+ 
++#ifdef A2DP_SINK
++    /* initialize a2dp specifics */
++    a2dp_stream_in_init(in);
++
++   /* set input config values */
++   if (config)
++   {
++      config->format = in_get_format((const struct audio_stream *)&in->stream);
++      config->sample_rate = in_get_sample_rate((const struct audio_stream *)&in->stream);
++      config->channel_mask = in_get_channels((const struct audio_stream *)&in->stream);
++   }
++#endif
+     *stream_in = &in->stream;
++
++#ifdef A2DP_SINK
++    /* retry logic to catch any timing variations on control channel */
++    for (i = 0; i < CTRL_CHAN_RETRY_COUNT; i++)
++    {
++        /* connect control channel if not already connected */
++        if ((in->ctrl_fd = skt_connect_in(in, A2DP_CTRL_PATH)) > 0)
++        {
++            /* success, now check if stack is ready */
++            if (check_a2dp_ready_in(in) == 0)
++                break;
++
++            ERROR("error : a2dp not ready, wait 250 ms and retry");
++            usleep(250000);
++            skt_disconnect(in->ctrl_fd);
++        }
++
++        /* ctrl channel not ready, wait a bit */
++        usleep(250000);
++    }
++
++    if (in->ctrl_fd == AUDIO_SKT_DISCONNECTED)
++    {
++        ERROR("ctrl socket failed to connect (%s)", strerror(errno));
++        ret = -1;
++        goto err_open;
++    }
++#endif
++
++    DEBUG("success");
+     return 0;
+ 
+ err_open:
+     free(in);
+     *stream_in = NULL;
++    ERROR("failed");
+     return ret;
+ }
+ 
+diff --git a/audio_a2dp_hw/audio_a2dp_hw.h b/audio_a2dp_hw/audio_a2dp_hw.h
+index 2015591..39e4121 100644
+--- a/audio_a2dp_hw/audio_a2dp_hw.h
++++ b/audio_a2dp_hw/audio_a2dp_hw.h
+@@ -4,3 +4,4 @@
+  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+@@ -30,7 +31,6 @@
+ /*****************************************************************************
+ **  Constants & Macros
+ ******************************************************************************/
+-
+ #define A2DP_AUDIO_HARDWARE_INTERFACE "audio.a2dp"
+ #define A2DP_CTRL_PATH "/data/misc/bluedroid/.a2dp_ctrl"
+ #define A2DP_DATA_PATH "/data/misc/bluedroid/.a2dp_data"
+@@ -39,6 +39,10 @@
+ #define AUDIO_STREAM_DEFAULT_FORMAT        AUDIO_FORMAT_PCM_16_BIT
+ #define AUDIO_STREAM_DEFAULT_CHANNEL_FLAG  AUDIO_CHANNEL_OUT_STEREO
+ #define AUDIO_STREAM_OUTPUT_BUFFER_SZ      (20*512)
++#ifdef A2DP_SINK
++#define AUDIO_STREAM_DEFAULT_INPUT_CHANNEL_FLAG  AUDIO_CHANNEL_IN_STEREO
++#define AUDIO_STREAM_INPUT_BUFFER_SZ             (20*512)
++#endif
+ #define AUDIO_SKT_DISCONNECTED             (-1)
+ 
+ typedef enum {
+diff --git a/bta/av/bta_av_aact.c b/bta/av/bta_av_aact.c
+index 53e8c03..93aab93 100644
+--- a/bta/av/bta_av_aact.c
++++ b/bta/av/bta_av_aact.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -81,6 +82,9 @@
+     bta_av_co_audio_start,
+     bta_av_co_audio_stop,
+     bta_av_co_audio_src_data_path,
++#ifdef A2DP_SINK
++    bta_av_co_audio_snk_data_path,
++#endif
+     bta_av_co_audio_delay
+ };
+ 
+@@ -113,6 +117,9 @@
+     bta_av_str_stopped,     /* BTA_AV_STR_STOPPED */
+     bta_av_reconfig,        /* BTA_AV_RECONFIG */
+     bta_av_data_path,       /* BTA_AV_DATA_PATH */
++#ifdef A2DP_SINK
++    bta_av_snk_data_path,   /* BTA_AV_SNK_DATA_PATH */
++#endif
+     bta_av_start_ok,        /* BTA_AV_START_OK */
+     bta_av_start_failed,    /* BTA_AV_START_FAILED */
+     bta_av_str_closed,      /* BTA_AV_STR_CLOSED */
+@@ -921,11 +928,19 @@
+         db_params.p_db = p_scb->p_disc_db;
+         db_params.p_attrs = attr_list;
+ 
++#ifdef A2DP_SINK
++        if(A2D_FindService(UUID_SERVCLASS_AUDIO_SOURCE, p_scb->peer_addr, &db_params,
++                        bta_av_a2d_sdp_cback) == A2D_SUCCESS)
++        {
++            return;
++        }
++#else
+         if(A2D_FindService(UUID_SERVCLASS_AUDIO_SINK, p_scb->peer_addr, &db_params,
+                         bta_av_a2d_sdp_cback) == A2D_SUCCESS)
+         {
+             return;
+         }
++#endif
+     }
+ 
+     /* when the code reaches here, either the DB is NULL
+@@ -2079,6 +2094,62 @@
+     }
+ }
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++**
++** Function         bta_av_snk_data_path
++**
++** Description      Handle stream sink data path.
++**
++** Returns          void
++**
++*******************************************************************************/
++void bta_av_snk_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data)
++{
++    BT_HDR *p_buf;
++
++    /* get a buffer from a2d queue to transport */
++    p_buf = (BT_HDR *)GKI_dequeue(&p_scb->q_info.a2d);
++    if (p_buf)
++    {
++        APPL_TRACE_DEBUG0("get a buffer from a2d queue");
++        if (p_scb->p_cos->snk_data(p_scb->codec_type, p_buf))
++        {
++            APPL_TRACE_DEBUG0("successful to transport, put new data into a2d queue");
++            /* successful to transport, put new data into a2d queue */
++            GKI_enqueue(&p_scb->q_info.a2d, p_data);
++        }
++        else
++        {
++            APPL_TRACE_DEBUG0("failed to transport, put the buffer back to a2d queue");
++            /* failed to transport, put the buffer back to a2d queue */
++            GKI_enqueue_head(&p_scb->q_info.a2d, p_buf);
++            if (p_scb->q_info.a2d.count < 3)
++            {
++                /* a2d queue is not full, put new data into a2d queue */
++                GKI_enqueue(&p_scb->q_info.a2d, p_data);
++            }
++            else
++            {
++                APPL_TRACE_DEBUG0("too many buffers in a2d queue, drop new data");
++                GKI_freebuf(p_data);
++            }
++        }
++    }
++    else
++    {
++        APPL_TRACE_DEBUG0("no buffer in a2d queue, transport new data directly");
++        /* no buffer in a2d queue, transport new data directly */
++        if (!p_scb->p_cos->snk_data(p_scb->codec_type, (BT_HDR *)p_data))
++        {
++            APPL_TRACE_DEBUG0("failed to transport data, put data into a2d queue");
++            /* failed to transport buffer, put buffer into a2d queue*/
++            GKI_enqueue(&p_scb->q_info.a2d, p_data);
++        }
++    }
++}
++#endif
++
+ /*******************************************************************************
+ **
+ ** Function         bta_av_start_ok
+diff --git a/bta/av/bta_av_act.c b/bta/av/bta_av_act.c
+index ada7592..cc48d7a 100755
+--- a/bta/av/bta_av_act.c
++++ b/bta/av/bta_av_act.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -1986,7 +1987,11 @@
+                 bta_ar_dereg_avrc (UUID_SERVCLASS_AV_REMOTE_CONTROL, BTA_ID_AV);
+ #endif
+                 bta_av_del_sdp_rec(&p_cb->sdp_a2d_handle);
++#ifdef A2DP_SINK
++                bta_sys_remove_uuid(UUID_SERVCLASS_AUDIO_SINK);
++#else
+                 bta_sys_remove_uuid(UUID_SERVCLASS_AUDIO_SOURCE);
++#endif
+             }
+         }
+         else
+diff --git a/bta/av/bta_av_int.h b/bta/av/bta_av_int.h
+index cd22bcb..c60e952 100644
+--- a/bta/av/bta_av_int.h
++++ b/bta/av/bta_av_int.h
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -58,6 +59,9 @@
+     BTA_AV_API_PROTECT_RSP_EVT,
+     BTA_AV_API_RC_OPEN_EVT,
+     BTA_AV_SRC_DATA_READY_EVT,
++#ifdef A2DP_SINK
++    BTA_AV_SNK_DATA_READY_EVT,
++#endif
+     BTA_AV_CI_SETCONFIG_OK_EVT,
+     BTA_AV_CI_SETCONFIG_FAIL_EVT,
+     BTA_AV_SDP_DISC_OK_EVT,
+@@ -90,6 +94,9 @@
+     BTA_AV_API_DEREGISTER_EVT,
+     BTA_AV_API_DISCONNECT_EVT,
+     BTA_AV_CI_SRC_DATA_READY_EVT,
++#ifdef A2DP_SINK
++    BTA_AV_CI_SNK_DATA_READY_EVT,
++#endif
+     BTA_AV_SIG_CHG_EVT,
+     BTA_AV_SIG_TIMER_EVT,
+     BTA_AV_SDP_AVRC_DISC_EVT,
+@@ -174,6 +181,10 @@
+ typedef void (*tBTA_AV_CO_STOP) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type);
+ typedef void * (*tBTA_AV_CO_DATAPATH) (tBTA_AV_CODEC codec_type,
+                                        UINT32 *p_len, UINT32 *p_timestamp);
++#ifdef A2DP_SINK
++typedef BOOLEAN (*tBTA_AV_CO_SNK_DATAPATH) (tBTA_AV_CODEC codec_type,
++                                            BT_HDR *p_buf);
++#endif
+ typedef void (*tBTA_AV_CO_DELAY) (tBTA_AV_HNDL hndl, UINT16 delay);
+ 
+ /* the call-out functions for one stream */
+@@ -188,6 +199,9 @@
+     tBTA_AV_CO_START    start;
+     tBTA_AV_CO_STOP     stop;
+     tBTA_AV_CO_DATAPATH data;
++#ifdef A2DP_SINK
++    tBTA_AV_CO_SNK_DATAPATH snk_data;
++#endif
+     tBTA_AV_CO_DELAY    delay;
+ } tBTA_AV_CO_FUNCTS;
+ 
+@@ -687,6 +701,9 @@
+ extern void bta_av_str_stopped (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+ extern void bta_av_reconfig (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+ extern void bta_av_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
++#ifdef A2DP_SINK
++extern void bta_av_snk_data_path (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
++#endif
+ extern void bta_av_start_ok (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+ extern void bta_av_start_failed (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+ extern void bta_av_str_closed (tBTA_AV_SCB *p_scb, tBTA_AV_DATA *p_data);
+diff --git a/bta/av/bta_av_main.c b/bta/av/bta_av_main.c
+index 749756d..8280174 100644
+--- a/bta/av/bta_av_main.c
++++ b/bta/av/bta_av_main.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -151,6 +152,9 @@
+ static void bta_av_api_enable(tBTA_AV_DATA *p_data);
+ static void bta_av_api_register(tBTA_AV_DATA *p_data);
+ static void bta_av_ci_data(tBTA_AV_DATA *p_data);
++#ifdef A2DP_SINK
++static void bta_av_ci_snk_data(tBTA_AV_DATA *p_data);
++#endif
+ #if (AVDT_REPORTING == TRUE)
+ static void bta_av_rpc_conn(tBTA_AV_DATA *p_data);
+ #endif
+@@ -169,6 +173,9 @@
+     bta_av_api_deregister,  /* BTA_AV_API_DEREGISTER_EVT */
+     bta_av_api_disconnect,  /* BTA_AV_API_DISCONNECT_EVT */
+     bta_av_ci_data,         /* BTA_AV_CI_SRC_DATA_READY_EVT */
++#ifdef A2DP_SINK
++    bta_av_ci_snk_data,     /* BTA_AV_CI_SNK_DATA_READY_EVT */
++#endif
+     bta_av_sig_chg,         /* BTA_AV_SIG_CHG_EVT */
+     bta_av_sig_timer,       /* BTA_AV_SIG_TIMER_EVT */
+     bta_av_rc_disc_done,    /* BTA_AV_SDP_AVRC_DISC_EVT */
+@@ -455,6 +462,31 @@
+ }
+ #endif
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++**
++** Function         bta_av_a2dp_data_cback
++**
++** Description      A2DP data callback is executed when AVDTP has a media packet
++**                  ready for the application. The function type is
++**                  tAVDT_DATA_CBACK.
++**
++** Returns          void
++**
++*******************************************************************************/
++static void bta_av_a2dp_data_cback(UINT8 handle, BT_HDR *p_pkt,
++                                   UINT32 time_stamp, UINT8 m_pt)
++{
++    /* send sink data ready msg to stream SM */
++    *((UINT32 *) (p_pkt + 1)) = time_stamp;
++    /* sequence number */
++    *((UINT16 *) (p_pkt + 1) + 2) = p_pkt->layer_specific;
++    p_pkt->layer_specific = BTA_AV_CHNL_AUDIO;
++    p_pkt->event = BTA_AV_CI_SNK_DATA_READY_EVT;
++    bta_sys_sendmsg(p_pkt);
++}
++#endif
++
+ /*******************************************************************************
+ **
+ ** Function         bta_av_api_register
+@@ -537,13 +569,20 @@
+         /* get stream configuration and create stream */
+         /* memset(&cs.cfg,0,sizeof(tAVDT_CFG)); */
+         cs.cfg.num_codec = 1;
++#ifdef A2DP_SINK
++        cs.tsep = AVDT_TSEP_SNK;
++#else
+         cs.tsep = AVDT_TSEP_SRC;
++#endif
+ 
+         /*
+          * memset of cs takes care setting call back pointers to null.
+         cs.p_data_cback = NULL;
+         cs.p_report_cback = NULL;
+         */
++#ifdef A2DP_SINK
++        cs.p_data_cback = bta_av_a2dp_data_cback;
++#endif
+         cs.nsc_mask = AVDT_NSC_RECONFIG |
+               ((bta_av_cb.features & BTA_AV_FEAT_PROTECT) ? 0 : AVDT_NSC_SECURITY);
+         APPL_TRACE_DEBUG1("nsc_mask: 0x%x", cs.nsc_mask);
+@@ -605,9 +644,15 @@
+             {
+                 /* create the SDP records on the 1st audio channel */
+                 bta_av_cb.sdp_a2d_handle = SDP_CreateRecord();
++#ifdef A2DP_SINK
++                A2D_AddRecord(UUID_SERVCLASS_AUDIO_SINK, p_service_name, NULL,
++                                  A2D_SUPF_SPEAKER, bta_av_cb.sdp_a2d_handle);
++                bta_sys_add_uuid(UUID_SERVCLASS_AUDIO_SINK);
++#else
+                 A2D_AddRecord(UUID_SERVCLASS_AUDIO_SOURCE, p_service_name, NULL,
+                                   A2D_SUPF_PLAYER, bta_av_cb.sdp_a2d_handle);
+                 bta_sys_add_uuid(UUID_SERVCLASS_AUDIO_SOURCE);
++#endif
+ 
+                 /* start listening when A2DP is registered */
+                 if (bta_av_cb.features & BTA_AV_FEAT_RCTG)
+@@ -704,6 +749,35 @@
+         }
+     }
+ }
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++**
++** Function         bta_av_ci_snk_data
++**
++** Description      forward the BTA_AV_CI_SNK_DATA_READY_EVT to stream state machine
++**
++**
++** Returns          void
++**
++*******************************************************************************/
++static void bta_av_ci_snk_data(tBTA_AV_DATA *p_data)
++{
++    tBTA_AV_SCB *p_scb;
++    int     i;
++    UINT8   chnl = (UINT8)p_data->hdr.layer_specific;
++
++    for( i=0; i < BTA_AV_NUM_STRS; i++ )
++    {
++        p_scb = bta_av_cb.p_scb[i];
++
++        if(p_scb && p_scb->chnl == chnl)
++        {
++            bta_av_ssm_execute(p_scb, BTA_AV_SNK_DATA_READY_EVT, p_data);
++        }
++    }
++}
++#endif
+ 
+ /*******************************************************************************
+ **
+@@ -1197,6 +1271,13 @@
+ #endif
+         /* non state machine events */
+         (*bta_av_nsm_act[event - BTA_AV_FIRST_NSM_EVT]) ((tBTA_AV_DATA *) p_msg);
++#ifdef A2DP_SINK
++        if (event == BTA_AV_CI_SNK_DATA_READY_EVT)
++        {
++            APPL_TRACE_DEBUG0("not to free p_msg, media task uses it directly to avoid memory copy");
++            return FALSE;
++        }
++#endif
+     }
+     else if (event >= BTA_AV_FIRST_SM_EVT && event <= BTA_AV_LAST_SM_EVT)
+     {
+@@ -1273,6 +1354,9 @@
+     case BTA_AV_API_PROTECT_RSP_EVT: return "API_PROTECT_RSP";
+     case BTA_AV_API_RC_OPEN_EVT: return "API_RC_OPEN";
+     case BTA_AV_SRC_DATA_READY_EVT: return "SRC_DATA_READY";
++#ifdef A2DP_SINK
++    case BTA_AV_SNK_DATA_READY_EVT: return "SNK_DATA_READY";
++#endif
+     case BTA_AV_CI_SETCONFIG_OK_EVT: return "CI_SETCONFIG_OK";
+     case BTA_AV_CI_SETCONFIG_FAIL_EVT: return "CI_SETCONFIG_FAIL";
+     case BTA_AV_SDP_DISC_OK_EVT: return "SDP_DISC_OK";
+@@ -1304,6 +1388,9 @@
+     case BTA_AV_API_DEREGISTER_EVT: return "API_DEREG";
+     case BTA_AV_API_DISCONNECT_EVT: return "API_DISCNT";
+     case BTA_AV_CI_SRC_DATA_READY_EVT: return "CI_DATA_READY";
++#ifdef A2DP_SINK
++    case BTA_AV_CI_SNK_DATA_READY_EVT: return "CI_SNK_DATA_READY";
++#endif
+     case BTA_AV_SIG_CHG_EVT: return "SIG_CHG";
+     case BTA_AV_SIG_TIMER_EVT: return "SIG_TMR";
+     case BTA_AV_SDP_AVRC_DISC_EVT: return "SDP_AVRC_DISC";
+diff --git a/bta/av/bta_av_sbc.c b/bta/av/bta_av_sbc.c
+index 1517270..df0db38 100644
+--- a/bta/av/bta_av_sbc.c
++++ b/bta/av/bta_av_sbc.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -588,3 +589,17 @@
+     A2D_BldSbcMplHdr(p, FALSE, FALSE, FALSE, (UINT8) fr_per_pkt);
+ }
+ 
++#ifdef A2DP_SINK
++void bta_av_sbc_prs_hdr(BT_HDR *p_buf, UINT16 *p_fr_per_pkt)
++{
++    BOOLEAN frag;
++    BOOLEAN start;
++    BOOLEAN last;
++
++    A2D_ParsSbcMplHdr((UINT8 *) (p_buf + 1) + p_buf->offset, &frag, &start,
++                      &last, (UINT8 *)p_fr_per_pkt);
++    p_buf->offset += BTA_AV_SBC_HDR_SIZE;
++    p_buf->len -= BTA_AV_SBC_HDR_SIZE;
++}
++#endif
++
+diff --git a/bta/av/bta_av_ssm.c b/bta/av/bta_av_ssm.c
+index 407146e..265cf2e 100644
+--- a/bta/av/bta_av_ssm.c
++++ b/bta/av/bta_av_ssm.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -74,6 +75,9 @@
+     BTA_AV_STR_STOPPED,
+     BTA_AV_RECONFIG,
+     BTA_AV_DATA_PATH,
++#ifdef A2DP_SINK
++    BTA_AV_SNK_DATA_PATH,
++#endif
+     BTA_AV_START_OK,
+     BTA_AV_START_FAILED,
+     BTA_AV_STR_CLOSED,
+@@ -121,6 +125,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+@@ -161,6 +168,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SETCONFIG_RSP,  BTA_AV_ST_RC_TIMER,    BTA_AV_INCOMING_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SETCONFIG_RSP,  BTA_AV_CLEANUP,        BTA_AV_INIT_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+@@ -201,6 +211,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_CONNECT_REQ,    BTA_AV_SIGNORE,        BTA_AV_OPENING_SST },
+@@ -241,6 +254,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SECURITY_RSP,   BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SET_USE_RC,     BTA_AV_OPEN_RC,        BTA_AV_OPEN_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_DATA_PATH,      BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SNK_DATA_PATH,  BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_OPEN_SST },
+@@ -281,6 +297,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_FREE_SDB,       BTA_AV_SIGNORE,        BTA_AV_RCFG_SST },
+@@ -321,6 +340,9 @@
+ /* API_PROTECT_RSP_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+ /* API_RC_OPEN_EVT  */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+ /* SRC_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
++#ifdef A2DP_SINK
++/* SNK_DATA_READY_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
++#endif
+ /* CI_SETCONFIG_OK_EVT */   {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+ /* CI_SETCONFIG_FAIL_EVT */ {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_CLOSING_SST },
+ /* SDP_DISC_OK_EVT */       {BTA_AV_SDP_FAILED,     BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+diff --git a/bta/include/bta_av_co.h b/bta/include/bta_av_co.h
+index 862ac5e..f0a932f 100644
+--- a/bta/include/bta_av_co.h
++++ b/bta/include/bta_av_co.h
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2003-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -309,6 +310,20 @@
+ *******************************************************************************/
+ BTA_API extern void * bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type,
+                                                     UINT32 *p_len, UINT32 *p_timestamp);
++#ifdef A2DP_SINK
++/*******************************************************************************
++**
++** Function         bta_av_co_audio_snk_data_path
++**
++** Description      This function is called to put the next data buffer into
++**                  the audio codec
++**
++** Returns          TRUE-successful, FALSE-failed
++**
++*******************************************************************************/
++BTA_API extern BOOLEAN bta_av_co_audio_snk_data_path(tBTA_AV_CODEC codec_type,
++                                                  BT_HDR *p_buf);
++#endif
+ 
+ /*******************************************************************************
+ **
+diff --git a/bta/include/bta_av_sbc.h b/bta/include/bta_av_sbc.h
+index 98eb6ae..358ab7a 100644
+--- a/bta/include/bta_av_sbc.h
++++ b/bta/include/bta_av_sbc.h
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -203,5 +204,18 @@
+ *******************************************************************************/
+ extern void bta_av_sbc_bld_hdr(BT_HDR *p_buf, UINT16 fr_per_pkt);
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++**
++** Function         bta_av_sbc_prs_hdr
++**
++** Description      This function parses the packet header for MPF1.
++**
++** Returns          void
++**
++*******************************************************************************/
++extern void bta_av_sbc_prs_hdr(BT_HDR *p_buf, UINT16 *p_fr_per_pkt);
++#endif
++
+ #endif /* BTA_AV_SBC_H */
+ 
+diff --git a/btif/co/bta_av_co.c b/btif/co/bta_av_co.c
+index 6089532..ac9ff71 100644
+--- a/btif/co/bta_av_co.c
++++ b/btif/co/bta_av_co.c
+@@ -1,7 +1,8 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2004-2012 Broadcom Corporation
+  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -791,6 +792,70 @@
+     return p_buf;
+ }
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         bta_av_co_audio_snk_data_path
++ **
++ ** Description      This function is called to manage data transfer from
++ **                  the AVDTP to audio codec.
++ **
++ ** Returns          TRUE-successful, FALSE-failed
++ **
++ *******************************************************************************/
++BTA_API BOOLEAN bta_av_co_audio_snk_data_path(tBTA_AV_CODEC codec_type,
++                                           BT_HDR *p_buf)
++{
++    UINT32 timestamp;
++    UINT16 seq_num;
++
++    FUNC_TRACE();
++
++    if (p_buf == NULL) {
++        APPL_TRACE_ERROR0("pointer to audio data is NULL");
++        return FALSE;
++    }
++
++#if defined(BTA_AV_CO_CP_SCMS_T) && (BTA_AV_CO_CP_SCMS_T == TRUE)
++    {
++        UINT8 *p;
++        if (bta_av_co_cp_is_active())
++        {
++            p = (UINT8 *)(p_buf + 1) + p_buf->offset;
++            bta_av_co_cp_set_flag(*p);
++            p_buf->len--;
++            p_buf->offset++;
++        }
++    }
++#endif
++
++    switch (codec_type)
++    {
++    case BTA_AV_CODEC_SBC:
++        /* In media packet SBC, the following information is available:
++         * p_buf->layer_specific : number of SBC frames in the packet
++         * p_buf->word[0] : timestamp
++         * p_buf->word[1] : seq_num
++         */
++         timestamp = *(UINT32 *)(p_buf + 1);
++         seq_num = *((UINT16 *)(p_buf + 1) + 2);
++
++        /* Parse packet header */
++        bta_av_sbc_prs_hdr(p_buf, &p_buf->layer_specific);
++        break;
++
++    default:
++        APPL_TRACE_ERROR1("bta_av_co_audio_snk_data_path Unsupported codec type (%d)", codec_type);
++        return FALSE;
++    }
++
++    btif_media_aa_writebuf(p_buf, timestamp, seq_num);
++    btif_media_aa_snk_data_ready();
++
++    return TRUE;
++}
++#endif
++
+ /*******************************************************************************
+  **
+  ** Function         bta_av_co_audio_drop
+@@ -1254,6 +1319,9 @@
+     switch (p_feeding->format)
+     {
+     case BTIF_AV_CODEC_PCM:
++#ifdef A2DP_SINK
++    case BTIF_AV_CODEC_SBC:
++#endif
+         new_cfg.id = BTIF_AV_CODEC_SBC;
+ 
+         sbc_config = btif_av_sbc_default_config;
+diff --git a/btif/include/btif_av_api.h b/btif/include/btif_av_api.h
+index 86cd40b..b2ff75b 100644
+--- a/btif/include/btif_av_api.h
++++ b/btif/include/btif_av_api.h
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -202,6 +203,24 @@
+     tBTIF_AV_MEDIA_FEED_CFG cfg;     /* Media codec configuration */
+ } tBTIF_AV_MEDIA_FEEDINGS;
+ 
++#ifdef A2DP_SINK
++/**
++ * Structure used to configure the AV media receiving
++ */
++#ifndef tBTIF_AV_MEDIA_RECEIVE_CFG_PCM
++#define tBTIF_AV_MEDIA_RECEIVE_CFG_PCM tBTIF_AV_MEDIA_FEED_CFG_PCM
++#endif
++
++#ifndef tBTIF_AV_MEDIA_RECEIVE_CFG
++#define tBTIF_AV_MEDIA_RECEIVE_CFG tBTIF_AV_MEDIA_FEED_CFG
++#endif
++
++#ifndef tBTIF_AV_MEDIA_RECEIVINGS
++#define tBTIF_AV_MEDIA_RECEIVINGS tBTIF_AV_MEDIA_FEEDINGS
++#endif
++
++#endif /* A2DP_SINK */
++
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/btif/include/btif_media.h b/btif/include/btif_media.h
+index 4cdbb8c..01eccee 100755
+--- a/btif/include/btif_media.h
++++ b/btif/include/btif_media.h
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -53,6 +54,9 @@
+ /* Transcoding definition for TxTranscoding and RxTranscoding */
+ #define BTIF_MEDIA_TRSCD_OFF             0
+ #define BTIF_MEDIA_TRSCD_PCM_2_SBC       1  /* Tx */
++#ifdef A2DP_SINK
++#define BTIF_MEDIA_TRSCD_SBC_2_PCM       2  /* Rx */
++#endif
+ 
+ 
+ /*******************************************************************************
+@@ -90,6 +94,14 @@
+         tBTIF_AV_FEEDING_MODE feeding_mode;
+         tBTIF_AV_MEDIA_FEEDINGS feeding;
+ } tBTIF_MEDIA_INIT_AUDIO_FEEDING;
++
++#ifdef A2DP_SINK
++typedef struct
++{
++        BT_HDR hdr;
++        tBTIF_AV_MEDIA_RECEIVINGS receiving;
++} tBTIF_MEDIA_INIT_AUDIO_RECEIVING;
++#endif
+ #endif
+ 
+ 
+@@ -118,6 +130,19 @@
+  **
+  *******************************************************************************/
+ extern BOOLEAN btif_media_task_enc_init_req(tBTIF_MEDIA_INIT_AUDIO * p_msg);
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_dec_init_req
++ **
++ ** Description      Request to initialize the media task decoder
++ **
++ ** Returns          TRUE is success
++ **
++ *******************************************************************************/
++extern BOOLEAN btif_media_task_dec_init_req(tBTIF_MEDIA_INIT_AUDIO * p_msg);
++#endif
+ 
+ /*******************************************************************************
+  **
+@@ -210,8 +235,31 @@
+  ** Returns          TRUE is success
+  **
+  *******************************************************************************/
+-
+ extern BOOLEAN btif_media_task_audio_feeding_init_req(tBTIF_MEDIA_INIT_AUDIO_FEEDING *p_msg);
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_audio_receiving_init_req
++ **
++ ** Description      Request to initialize audio receiving
++ **
++ ** Returns          TRUE is success
++ **
++ *******************************************************************************/
++extern BOOLEAN btif_media_task_audio_receiving_init_req(tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_msg);
++
++/*******************************************************************************
++ ** Function         bt_media_aa_snk_data_ready
++ **
++ ** Descriptoin      This function sends an event to meida task that Advance Audio
++ **                  media GKI buffer is ready in receiving queue
++ **
++ ** Returns          void
++*******************************************************************************/
++extern void btif_media_aa_snk_data_ready(void);
++#endif
++
+ #endif
+ 
+ /*******************************************************************************
+diff --git a/btif/src/btif_av.c b/btif/src/btif_av.c
+index f173f6a..7e9551e 100755
+--- a/btif/src/btif_av.c
++++ b/btif/src/btif_av.c
+@@ -3,4 +3,5 @@
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -766,8 +767,11 @@
+     {
+         if (btif_a2dp_start_media_task() != GKI_SUCCESS)
+             return BT_STATUS_FAIL;
+-
++#ifdef A2DP_SINK
++        btif_enable_service(BTA_A2DP_SOURCE_SERVICE_ID);
++#else
+         btif_enable_service(BTA_A2DP_SERVICE_ID);
++#endif
+ 
+         /* Also initialize the AV state machine */
+         btif_av_cb.sm_handle = btif_sm_init((const btif_sm_handler_t*)btif_av_state_handlers, BTIF_AV_STATE_IDLE);
+@@ -830,6 +840,10 @@
+     CHECK_BTAV_INIT();
++#ifdef A2DP_SINK
++    return btif_queue_connect(UUID_SERVCLASS_AUDIO_SINK, bd_addr, connect_int,BTIF_QUEUE_CONNECT_EVT);
++#else
+     if(btif_av_cb.bta_handle)
+        return btif_queue_connect(UUID_SERVCLASS_AUDIO_SOURCE, bd_addr, connect_int, BTIF_QUEUE_CONNECT_EVT);
+     else
+        return btif_queue_connect(UUID_SERVCLASS_AUDIO_SOURCE, bd_addr, connect_int, BTIF_QUEUE_PENDING_CONECT_EVT);
++#endif
+ }
+@@ -846,7 +854,11 @@
+     {
+         btif_a2dp_stop_media_task();
+ 
++#ifdef A2DP_SINK
++        btif_disable_service(BTA_A2DP_SOURCE_SERVICE_ID);
++#else
+         btif_disable_service(BTA_A2DP_SERVICE_ID);
++#endif
+         bt_av_callbacks = NULL;
+ 
+         /* Also shut down the AV state machine */
+diff --git a/btif/src/btif_dm.c b/btif/src/btif_dm.c
+index b2e80d3..b6aca58 100644
+--- a/btif/src/btif_dm.c
++++ b/btif/src/btif_dm.c
+@@ -3,4 +3,5 @@
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -175,6 +176,9 @@
+          {
+               btif_hf_execute_service(b_enable);
+          }break;
++#ifdef A2DP_SINK
++         case BTA_A2DP_SOURCE_SERVICE_ID:
++#endif
+          case BTA_A2DP_SERVICE_ID:
+          {
+               btif_av_execute_service(b_enable);
+diff --git a/btif/src/btif_media_task.c b/btif/src/btif_media_task.c
+index ff9f92c..1c15a78 100755
+--- a/btif/src/btif_media_task.c
++++ b/btif/src/btif_media_task.c
+@@ -2,6 +2,7 @@
+  *
+  *  Copyright (C) 2009-2012 Broadcom Corporation
+  *  Copyright (c) 2013, Linux Foundation. All rights reserved.
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -57,6 +58,9 @@
+ 
+ #if (BTA_AV_INCLUDED == TRUE)
+ #include "sbc_encoder.h"
++#ifdef A2DP_SINK
++#include "sbc_decoder.h"
++#endif
+ #endif
+ 
+ #define LOG_TAG "BTIF-MEDIA"
+@@ -219,6 +222,13 @@
+     tBTIF_AV_MEDIA_FEEDINGS media_feeding;
+     tBTIF_AV_MEDIA_FEEDINGS_STATE media_feeding_state;
+     SBC_ENC_PARAMS encoder;
++#ifdef A2DP_SINK
++    BUFFER_Q RxAaQ;
++    UINT16 RxAaMtuSize;
++    UINT8 RxTranscoding;
++    tBTIF_AV_MEDIA_RECEIVINGS media_receiving;
++    SBC_DEC_PARAMS decoder;
++#endif
+     UINT8 busy_level;
+     void* av_sm_hdl;
+     UINT8 a2dp_cmd_pending; /* we can have max one command pending */
+@@ -284,6 +290,13 @@
+ static void btif_media_task_audio_feeding_init(BT_HDR *p_msg);
+ static void btif_media_task_aa_tx_flush(BT_HDR *p_msg);
+ static void btif_media_aa_prep_2_send(UINT8 nb_frame);
++#ifdef A2DP_SINK
++static void btif_media_task_dec_init(BT_HDR *p_msg);
++static void btif_media_task_audio_receiving_init(BT_HDR *p_msg);
++static void btif_media_aa_recv_frame(void);
++static void btif_media_aa_recv_sbc_frame(BT_HDR *p_buf);
++static BOOLEAN btif_media_aa_write_receiving(tUIPC_CH_ID channel_id);
++#endif
+ #endif
+ extern BOOLEAN btif_hf_is_call_idle();
+ 
+@@ -554,11 +571,13 @@
+                 connection events */
+             UIPC_Ioctl(UIPC_CH_ID_AV_AUDIO, UIPC_REG_REMOVE_ACTIVE_READSET, NULL);
+ 
++            #ifndef A2DP_SINK
+             /* Start the media task to encode SBC */
+             btif_media_task_start_aa_req();
+ 
+             /* make sure we update any changed sbc encoder params */
+             btif_a2dp_encoder_update();
++            #endif
+ 
+             /* ack back when media task is fully started */
+             break;
+@@ -579,8 +611,42 @@
+             APPL_TRACE_ERROR1("### A2DP-DATA EVENT %d NOT HANDLED ###", event);
+             break;
+     }
+ }
++
++#ifdef A2DP_SINK
++static void btif_a2dp_decoder_init(void)
++{
++    UINT16 minmtu;
++    tBTIF_MEDIA_INIT_AUDIO msg;
++    tA2D_SBC_CIE sbc_config;
++
++    /* lookup table for converting channel mode */
++    UINT16 codec_mode_tbl[5] = { SBC_JOINT_STEREO, SBC_STEREO, SBC_DUAL, 0, SBC_MONO };
++
++    /* lookup table for converting number of blocks */
++    UINT16 codec_block_tbl[5] = { 16, 12, 8, 0, 4 };
++
++    /* lookup table to convert freq */
++    UINT16 freq_block_tbl[5] = { SBC_sf48000, SBC_sf44100, SBC_sf32000, 0, SBC_sf16000 };
++
++    APPL_TRACE_DEBUG0("btif_a2dp_decoder_init");
++
++    /* Retrieve the current SBC configuration (default if currently not used) */
++    bta_av_co_audio_get_sbc_config(&sbc_config, &minmtu);
++    msg.NumOfSubBands = (sbc_config.num_subbands == A2D_SBC_IE_SUBBAND_4) ? 4 : 8;
++    msg.NumOfBlocks = codec_block_tbl[sbc_config.block_len >> 5];
++    msg.AllocationMethod = (sbc_config.alloc_mthd == A2D_SBC_IE_ALLOC_MD_L) ? SBC_LOUDNESS : SBC_SNR;
++    msg.ChannelMode = codec_mode_tbl[sbc_config.ch_mode >> 1];
++    msg.SamplingFreq = freq_block_tbl[sbc_config.samp_freq >> 5];
++    msg.MtuSize = minmtu;
++
++    APPL_TRACE_EVENT1("msg.ChannelMode %x", msg.ChannelMode);
++
++    /* Init the media task to decode SBC properly */
++    btif_media_task_dec_init_req(&msg);
++}
++#endif
+ 
+ 
+ /*****************************************************************************
+  **  BTIF ADAPTATION
+@@ -765,6 +818,35 @@
+ 
+ tBTIF_STATUS btif_a2dp_setup_codec(void)
+ {
++#ifdef A2DP_SINK
++    tBTIF_AV_MEDIA_RECEIVINGS media_receiving;
++    tBTIF_STATUS status;
++
++    APPL_TRACE_EVENT0("## A2DP SETUP CODEC ##");
++
++    GKI_disable();
++
++    /* for now hardcode 44.1 khz 16 bit stereo PCM format */
++    media_receiving.cfg.pcm.sampling_freq = 44100;
++    media_receiving.cfg.pcm.bit_per_sample = 16;
++    media_receiving.cfg.pcm.num_channel = 2;
++    media_receiving.format = BTIF_AV_CODEC_SBC;
++
++    if (bta_av_co_audio_set_codec(&media_receiving, &status))
++    {
++        tBTIF_MEDIA_INIT_AUDIO_RECEIVING mReceive;
++
++        /* Init the decoding task */
++        btif_a2dp_decoder_init();
++
++        /* Build the media task configuration */
++        mReceive.receiving = media_receiving;
++        /* Send message to Media task to configure transcoding */
++        btif_media_task_audio_receiving_init_req(&mReceive);
++    }
++
++    GKI_enable();
++#else
+     tBTIF_AV_MEDIA_FEEDINGS media_feeding;
+     tBTIF_STATUS status;
+ 
+@@ -816,6 +875,7 @@
+     }
+ 
+     GKI_enable();
++#endif
+     return status;
+ }
+ 
+@@ -1247,6 +1330,14 @@
+     case BTIF_MEDIA_UIPC_RX_RDY:
+         btif_media_task_aa_handle_uipc_rx_rdy();
+         break;
++#ifdef A2DP_SINK
++    case BTIF_MEDIA_SBC_DEC_INIT:
++        btif_media_task_dec_init(p_msg);
++        break;
++    case BTIF_MEDIA_AUDIO_RECEIVING_INIT:
++        btif_media_task_audio_receiving_init(p_msg);
++        break;
++#endif
+ #endif
+     default:
+         APPL_TRACE_ERROR1("ERROR in btif_media_task_handle_cmd unknown event %d", p_msg->event);
+@@ -1266,13 +1357,76 @@
+  *******************************************************************************/
+ static void btif_media_task_handle_media(BT_HDR *p_msg)
+ {
++#ifdef A2DP_SINK
++    APPL_TRACE_DEBUG0("btif_media_task_handle_media");
++    btif_media_aa_recv_frame();
++#else
+     APPL_TRACE_ERROR0("ERROR btif_media_task_handle_media: not in use");
++#endif
+ 
+     GKI_freebuf(p_msg);
+ }
+ 
++#ifdef A2DP_SINK
++static void btif_media_aa_recv_frame(void)
++{
++    BT_HDR *p_buf;
+ 
++    p_buf = (BT_HDR *)GKI_dequeue(&(btif_media_cb.RxAaQ));
++    if (p_buf)
++    {
++        switch (btif_media_cb.RxTranscoding)
++        {
++        case BTIF_MEDIA_TRSCD_SBC_2_PCM:
++            btif_media_aa_recv_sbc_frame(p_buf);
++            break;
+ 
++        default:
++            APPL_TRACE_ERROR1("ERROR btif_media_aa_recv_frame unsupported transcoding format 0x%x",btif_media_cb.RxTranscoding);
++            GKI_freebuf(p_buf);
++            break;
++        }
++    }
++}
++
++static void btif_media_aa_recv_sbc_frame(BT_HDR *p_buf)
++{
++    /* call SBC decoder to decode SBC frames to 16bit PCM */
++    btif_media_cb.decoder.pu8Packet = (UINT8 *)(p_buf + 1) + p_buf->offset;
++    btif_media_cb.decoder.u16PacketLength = p_buf->len;
++    do
++    {
++        SBC_Decoder(&btif_media_cb.decoder);
++        if (btif_media_cb.decoder.s16SbcFrameLength < 1)
++        {
++            break;
++        }
++
++        btif_media_cb.decoder.pu8Packet +=
++                                        btif_media_cb.decoder.s16SbcFrameLength;
++        btif_media_cb.decoder.u16PacketLength -=
++                                        btif_media_cb.decoder.s16SbcFrameLength;
++
++        /* Write PCM data to upper layer */
++        if (!btif_media_aa_write_receiving(UIPC_CH_ID_AV_AUDIO))
++        {
++            APPL_TRACE_ERROR0("btif_media_aa_recv_sbc_frame failed to write PCM data");
++        }
++    } while (1);
++
++    GKI_freebuf(p_buf);
++}
++
++static BOOLEAN btif_media_aa_write_receiving(tUIPC_CH_ID channel_id)
++{
++    UINT16 event;
++
++    event = 0;
++    return UIPC_Send(channel_id, event,
++                     (UINT8 *)btif_media_cb.decoder.as16SbBuffer,
++                     btif_media_cb.decoder.s16PcmLength);
++}
++#endif
+ 
+ #if (BTA_AV_INCLUDED == TRUE)
+ /*******************************************************************************
+@@ -1298,6 +1452,32 @@
+     GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
+     return TRUE;
+ }
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_dec_init_req
++ **
++ ** Description
++ **
++ ** Returns          TRUE is success
++ **
++ *******************************************************************************/
++BOOLEAN btif_media_task_dec_init_req(tBTIF_MEDIA_INIT_AUDIO *p_msg)
++{
++    tBTIF_MEDIA_INIT_AUDIO *p_buf;
++    if (NULL == (p_buf = GKI_getbuf(sizeof(tBTIF_MEDIA_INIT_AUDIO))))
++    {
++        return FALSE;
++    }
++
++    memcpy(p_buf, p_msg, sizeof(tBTIF_MEDIA_INIT_AUDIO));
++    p_buf->hdr.event = BTIF_MEDIA_SBC_DEC_INIT;
++
++    GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
++    return TRUE;
++}
++#endif
+ 
+ /*******************************************************************************
+  **
+@@ -1346,6 +1526,32 @@
+     GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
+     return TRUE;
+ }
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_audio_receiving_init_req
++ **
++ ** Description
++ **
++ ** Returns          TRUE is success
++ **
++ *******************************************************************************/
++BOOLEAN btif_media_task_audio_receiving_init_req(tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_msg)
++{
++    tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_buf;
++    if (NULL == (p_buf = GKI_getbuf(sizeof(tBTIF_MEDIA_INIT_AUDIO_RECEIVING))))
++    {
++        return FALSE;
++    }
++
++    memcpy(p_buf, p_msg, sizeof(tBTIF_MEDIA_INIT_AUDIO_RECEIVING));
++    p_buf->hdr.event = BTIF_MEDIA_AUDIO_RECEIVING_INIT;
++
++    GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_CMD_MBOX, p_buf);
++    return TRUE;
++}
++#endif
+ 
+ /*******************************************************************************
+  **
+@@ -1520,6 +1689,38 @@
+     SBC_Encoder_Init(&(btif_media_cb.encoder));
+     APPL_TRACE_DEBUG1("btif_media_task_enc_init bit pool %d", btif_media_cb.encoder.s16BitPool);
+ }
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function       btif_media_task_dec_init
++ **
++ ** Description    Initialize decoding task
++ **
++ ** Returns        void
++ **
++ *******************************************************************************/
++static void btif_media_task_dec_init(BT_HDR *p_msg)
++{
++    tBTIF_MEDIA_INIT_AUDIO *pInitAudio = (tBTIF_MEDIA_INIT_AUDIO *) p_msg;
++
++    APPL_TRACE_DEBUG0("btif_media_task_dec_init");
++
++    btif_media_cb.timestamp = 0;
++
++    /* Default transcoding is SBC to PCM, modified by receiving configuration */
++    btif_media_cb.RxTranscoding = BTIF_MEDIA_TRSCD_SBC_2_PCM;
++    btif_media_cb.RxAaMtuSize = ((BTIF_MEDIA_AA_BUF_SIZE-BTIF_MEDIA_AA_SBC_OFFSET-sizeof(BT_HDR))
++            < pInitAudio->MtuSize) ? (BTIF_MEDIA_AA_BUF_SIZE - BTIF_MEDIA_AA_SBC_OFFSET
++            - sizeof(BT_HDR)) : pInitAudio->MtuSize;
++
++    APPL_TRACE_EVENT3("btif_media_task_dec_init busy %d, mtu %d, peer mtu %d",
++                     btif_media_cb.busy_level, btif_media_cb.RxAaMtuSize, pInitAudio->MtuSize);
++
++    /* Reset entirely the SBC decoder */
++    SBC_Decoder_Init(&(btif_media_cb.decoder));
++}
++#endif
+ 
+ static UINT16 btif_media_task_get_min_high_bp_avdtp_mtu(UINT16 freq)
+ {
+@@ -1699,6 +1937,87 @@
+     }
+ }
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_sbc2pcm_init
++ **
++ ** Description      Init decoding task for SBC to PCM according to receiving
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_sbc2pcm_init(tBTIF_MEDIA_INIT_AUDIO_RECEIVING * p_receiving)
++{
++    BOOLEAN reconfig_needed = FALSE;
++
++    APPL_TRACE_DEBUG0("SBC receiving:");
++    APPL_TRACE_DEBUG1("sampling_freq:%d", p_receiving->receiving.cfg.pcm.sampling_freq);
++    APPL_TRACE_DEBUG1("num_channel:%d", p_receiving->receiving.cfg.pcm.num_channel);
++    APPL_TRACE_DEBUG1("bit_per_sample:%d", p_receiving->receiving.cfg.pcm.bit_per_sample);
++#if 0
++    /* Check the SBC receiving sampling_freq */
++    switch (p_receiving->receiving.cfg.pcm.sampling_freq)
++    {
++        case  8000:
++        case 12000:
++        case 16000:
++        case 24000:
++        case 32000:
++        case 48000:
++            /* For these sampling_freq the AV connection must be 48000 */
++            if (btif_media_cb.decoder.s16SamplingFreq != SBC_sf48000)
++            {
++                /* Reconfiguration needed at 48000 */
++                APPL_TRACE_DEBUG0("SBC Reconfiguration needed at 48000");
++                btif_media_cb.decoder.s16SamplingFreq = SBC_sf48000;
++                reconfig_needed = TRUE;
++            }
++            break;
++
++        case 11025:
++        case 22050:
++        case 44100:
++            /* For these sampling_freq the AV connection must be 44100 */
++            if (btif_media_cb.decoder.s16SamplingFreq != SBC_sf44100)
++            {
++                /* Reconfiguration needed at 44100 */
++                APPL_TRACE_DEBUG0("SBC Reconfiguration needed at 44100");
++                btif_media_cb.decoder.s16SamplingFreq = SBC_sf44100;
++                reconfig_needed = TRUE;
++            }
++            break;
++        default:
++            APPL_TRACE_DEBUG0("Receiving SBC sampling_freq unsupported");
++            break;
++    }
++
++    /* Some AV Headsets do not support Mono => always ask for Stereo */
++    if (btif_media_cb.decoder.s16ChannelMode == SBC_MONO)
++    {
++        APPL_TRACE_DEBUG0("SBC Reconfiguration needed in Stereo");
++        btif_media_cb.decoder.s16ChannelMode = SBC_JOINT_STEREO;
++        reconfig_needed = TRUE;
++    }
++
++    if (reconfig_needed != FALSE)
++    {
++        APPL_TRACE_DEBUG1("btif_media_task_sbc2pcm_init :: mtu %d", btif_media_cb.RxAaMtuSize);
++        APPL_TRACE_DEBUG6("ch mode %d, nbsubd %d, nb %d, alloc %d, rate %d, freq %d",
++                btif_media_cb.decoder.s16ChannelMode,
++                btif_media_cb.decoder.s16NumOfSubBands, btif_media_cb.decoder.s16NumOfBlocks,
++                btif_media_cb.decoder.s16AllocationMethod, btif_media_cb.decoder.u16BitRate,
++                btif_media_cb.decoder.s16SamplingFreq);
++
++        SBC_Decoder_Init(&(btif_media_cb.decoder));
++    }
++    else
++#endif
++    {
++        APPL_TRACE_DEBUG0("btif_media_task_sbc2pcm_init no SBC reconfig needed");
++    }
++}
++#endif
+ 
+ /*******************************************************************************
+  **
+@@ -1732,6 +2051,40 @@
+             break;
+     }
+ }
++
++#ifdef A2DP_SINK
++/*******************************************************************************
++ **
++ ** Function         btif_media_task_audio_receiving_init
++ **
++ ** Description      Initialize the audio path according to the receiving format
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++static void btif_media_task_audio_receiving_init(BT_HDR *p_msg)
++{
++    tBTIF_MEDIA_INIT_AUDIO_RECEIVING *p_receiving = (tBTIF_MEDIA_INIT_AUDIO_RECEIVING *) p_msg;
++
++    APPL_TRACE_DEBUG1("btif_media_task_audio_receiving_init format:%d", p_receiving->receiving.format);
++
++    /* Save Media Receiving information */
++    btif_media_cb.media_receiving = p_receiving->receiving;
++
++    /* Handle different receiving formats */
++    switch (p_receiving->receiving.format)
++    {
++        case BTIF_AV_CODEC_SBC:
++            btif_media_cb.RxTranscoding = BTIF_MEDIA_TRSCD_SBC_2_PCM;
++            btif_media_task_sbc2pcm_init(p_receiving);
++            break;
++
++        default :
++            APPL_TRACE_ERROR1("unknown receiving format %d", p_receiving->receiving.format);
++            break;
++    }
++}
++#endif
+ 
+ /*******************************************************************************
+  **
+@@ -1902,6 +2255,42 @@
+     return GKI_dequeue(&(btif_media_cb.TxAaQ));
+ }
+ 
++#ifdef A2DP_SINK
++/*******************************************************************************
++ ** Function         btif_media_aa_writebuf
++ **
++ ** Description      Enqueue an Advance Audio media GKI buffer to be processed by btif media task
++ **
++ **
++ ** Returns          void
++*******************************************************************************/
++void btif_media_aa_writebuf(BT_HDR *p_buf, UINT32 timestamp, UINT16 seq_num)
++{
++    GKI_enqueue(&(btif_media_cb.RxAaQ), p_buf);
++}
++
++/*******************************************************************************
++ ** Function         bt_media_aa_snk_data_ready
++ **
++ ** Descriptoin      This function sends an event to meida task that Advance Audio
++ **                  media GKI buffer is ready in receiving queue
++ **
++ ** Returns          void
++*******************************************************************************/
++void btif_media_aa_snk_data_ready(void)
++{
++    BT_HDR *p_buf;
++
++    p_buf = GKI_getbuf(sizeof(BT_HDR));
++    if (p_buf)
++    {
++        p_buf->event = BTIF_MEDIA_AA_RX_RDY;
++
++        GKI_send_msg(BT_MEDIA_TASK, BTIF_MEDIA_TASK_DATA_MBOX, p_buf);
++    }
++}
++#endif
++
+ /*******************************************************************************
+  **
+  ** Function         btif_media_aa_read_feeding
+diff --git a/btif/src/btif_storage.c b/btif/src/btif_storage.c
+index 65cffbc..e40d6d1 100644
+--- a/btif/src/btif_storage.c
++++ b/btif/src/btif_storage.c
+@@ -3,4 +3,5 @@
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -646,6 +647,14 @@
+                                               p_uuid+num_uuids);
+                             num_uuids++;
+                         }break;
++#ifdef A2DP_SINK
++                    case BTA_A2DP_SOURCE_SERVICE_ID:
++                        {
++                            uuid16_to_uuid128(UUID_SERVCLASS_AUDIO_SINK,
++                                              p_uuid+num_uuids);
++                            num_uuids++;
++                        }break;
++#endif
+                     case BTA_A2DP_SERVICE_ID:
+                         {
+                             uuid16_to_uuid128(UUID_SERVCLASS_AUDIO_SOURCE,
+diff --git a/embdrv/sbc/decoder/include/sbc_decoder.h b/embdrv/sbc/decoder/include/sbc_decoder.h
+new file mode 100755
+index 0000000..8bfb9e4
+--- /dev/null
++++ b/embdrv/sbc/decoder/include/sbc_decoder.h
+@@ -0,0 +1,73 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2014 Tieto Corporation
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *  http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  This file contains constants and structures used by Decoder.
++ *
++ ******************************************************************************/
++
++#ifndef SBC_DECODER_H
++#define SBC_DECODER_H
++
++#define DECODER_VERSION "0025"
++
++#ifdef BUILDCFG
++    #include "bt_target.h"
++#endif
++
++/*DEFINES*/
++#define MINIMUM_DEC_VX_BUFFER_SIZE (8*10*2)
++#ifndef DEC_VX_BUFFER_SIZE
++#define DEC_VX_BUFFER_SIZE (MINIMUM_DEC_VX_BUFFER_SIZE + 64)
++/*#define DEC_VX_BUFFER_SIZE MINIMUM_DEC_VX_BUFFER_SIZE + 1024*/
++#endif
++
++#include "sbc_types.h"
++#include "sbc_encoder.h"
++
++typedef struct SBC_DEC_PARAMS_TAG
++{
++    /*-----------output parameter---------------*/
++    // the final decoded PCM for one frame
++    SINT16 as16SbBuffer[SBC_MAX_NUM_OF_CHANNELS * SBC_MAX_NUM_OF_SUBBANDS *  SBC_MAX_NUM_OF_BLOCKS];
++    // the length of PCM for one frame so that the caller can copy
++    SINT16 s16PcmLength;
++    // the lenght of a decoded SBC frame
++    SINT16 s16SbcFrameLength;
++
++    /*-----------input parameter---------------*/
++    // the data need to be decoded
++    UINT8  *pu8Packet;
++    UINT16 u16PacketLength;
++
++}SBC_DEC_PARAMS;
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++SBC_API extern void SBC_Decoder(SBC_DEC_PARAMS *strDecParams);
++
++SBC_API extern void SBC_Decoder_Init(SBC_DEC_PARAMS *strDecParams);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/embdrv/sbc/decoder/srce/sbc_decoder.c b/embdrv/sbc/decoder/srce/sbc_decoder.c
+new file mode 100755
+index 0000000..a4547fb
+--- /dev/null
++++ b/embdrv/sbc/decoder/srce/sbc_decoder.c
+@@ -0,0 +1,35 @@
++/******************************************************************************
++ *
++ *  Copyright (C) 2014 Tieto Corporation
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at:
++ *
++ *  http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ *
++ ******************************************************************************/
++
++/******************************************************************************
++ *
++ *  SBC decoder stub
++ *
++ ******************************************************************************/
++#include "sbc_decoder.h"
++
++void SBC_Decoder(SBC_DEC_PARAMS *pstrDecParams)
++{
++    pstrDecParams->s16PcmLength      = 0;
++    pstrDecParams->s16SbcFrameLength = 0;
++}
++
++void SBC_Decoder_Init(SBC_DEC_PARAMS *pstrDecParams)
++{
++}
++
+diff --git a/main/Android.mk b/main/Android.mk
+index 5230b32..6392c0f 100644
+--- a/main/Android.mk
++++ b/main/Android.mk
+@@ -70,6 +70,10 @@
+ 	../embdrv/sbc/encoder/srce/sbc_encoder.c \
+ 	../embdrv/sbc/encoder/srce/sbc_packing.c \
+ 
++# sbc decoder
++LOCAL_SRC_FILES+= \
++	../embdrv/sbc/decoder/srce/sbc_decoder.c \
++
+ LOCAL_SRC_FILES+= \
+ 	../udrv/ulinux/uipc.c
+ 
+@@ -94,6 +98,7 @@
+ 	$(LOCAL_PATH)/../hci/include\
+ 	$(LOCAL_PATH)/../brcm/include \
+ 	$(LOCAL_PATH)/../embdrv/sbc/encoder/include \
++	$(LOCAL_PATH)/../embdrv/sbc/decoder/include \
+ 	$(LOCAL_PATH)/../audio_a2dp_hw \
+ 	$(LOCAL_PATH)/../utils/include \
+ 	$(bdroid_C_INCLUDES) \
+diff --git a/stack/avdt/avdt_scb_act.c b/stack/avdt/avdt_scb_act.c
+index 66f9b7d..c29b724 100644
+--- a/stack/avdt/avdt_scb_act.c
++++ b/stack/avdt/avdt_scb_act.c
+@@ -245,6 +245,7 @@
+     UINT16  ex_len;
+     UINT8   pad_len = 0;
+ 
++    AVDT_TRACE_DEBUG0("Enter avdt_scb_hdl_pkt_no_frag");
+     p = p_start = (UINT8 *)(p_data->p_pkt + 1) + p_data->p_pkt->offset;
+ 
+     /* parse media packet header */
+@@ -289,6 +290,7 @@
+ 
+         if (p_scb->cs.p_data_cback != NULL)
+         {
++            AVDT_TRACE_DEBUG0("p_scb->cs.p_data_cback != NULL");
+             /* report sequence number */
+             p_data->p_pkt->layer_specific = seq;
+             (*p_scb->cs.p_data_cback)(avdt_scb_to_hdl(p_scb), p_data->p_pkt,
+@@ -301,6 +303,7 @@
+              && (p_scb->p_media_buf != NULL)
+              && (p_scb->media_buf_len > p_data->p_pkt->len))
+             {
++                AVDT_TRACE_DEBUG0("p_scb->cs.p_media_cback != NULL");
+                 /* media buffer enough length is assigned by application. Lets use it*/
+                 memcpy(p_scb->p_media_buf,(UINT8*)(p_data->p_pkt + 1) + p_data->p_pkt->offset,
+                     p_data->p_pkt->len);
+@@ -421,6 +424,7 @@
+     UINT32  payload_len; /* payload length */
+     UINT16  frag_len; /* fragment length */
+ 
++    AVDT_TRACE_DEBUG0("Enter avdt_scb_hdl_pkt_frag");
+     p = (UINT8 *)(p_data->p_pkt + 1) + p_data->p_pkt->offset;
+     p_end = p + p_data->p_pkt->len;
+     /* parse all fragments */
+@@ -607,6 +611,7 @@
+             /* send total media packet up */
+             if (p_scb->cs.p_media_cback != NULL)
+             {
++                AVDT_TRACE_DEBUG0("p_scb->cs.p_media_cback != NULL");
+                 (*p_scb->cs.p_media_cback)(avdt_scb_to_hdl(p_scb), p_payload,
+                                            payload_len, time_stamp, seq, m_pt, marker);
+             }
+diff --git a/udrv/ulinux/uipc.c b/udrv/ulinux/uipc.c
+index a3529cf..1bfa4c7 100644
+--- a/udrv/ulinux/uipc.c
++++ b/udrv/ulinux/uipc.c
+@@ -1,6 +1,7 @@
+ /******************************************************************************
+  *
+  *  Copyright (C) 2009-2012 Broadcom Corporation
++ *  Copyright (C) 2014 Tieto Corporation
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -732,12 +733,15 @@
+ 
+     if (write(uipc_main.ch[ch_id].fd, p_buf, msglen) < 0)
+     {
++        BTIF_TRACE_DEBUG1("fd=%d", uipc_main.ch[ch_id].fd);
+         BTIF_TRACE_ERROR1("failed to write (%s)", strerror(errno));
++        UIPC_UNLOCK()
++        return FALSE;
+     }
+ 
+     UIPC_UNLOCK();
+ 
+-    return FALSE;
++    return TRUE;
+ }
+ 
+ /*******************************************************************************
